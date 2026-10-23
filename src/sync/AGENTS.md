@@ -17,7 +17,7 @@ For each adapter in `app.adapters`, in order:
 - `warnings`: each read's `warnings`, plus tool results that had no call and snapshot entries for sessions it wasn't asked about.
 - `failures`: each `SyncIssue` names the harness, the step (`list`, `read` or `snapshot`), the source when there is one, and the message.
 
-**A non-empty `failures` means the run is half-finished,** and the commands must exit non-zero on it after printing what did sync. Until streams A and B merge, both real adapters throw "not implemented", so every real run reports two `list` and two `snapshot` failures.
+**A non-empty `failures` means the run is half-finished,** and the commands must exit non-zero on it after printing what did sync.
 
 ## Failure isolation
 
