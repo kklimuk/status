@@ -26,6 +26,7 @@
 
   `createApp(environment)` builds it and opens `<status>/status.db`.
 - **`src/harnesses/` owns the session contract** and one adapter per harness (`src/harnesses/AGENTS.md`).
+- **`src/sync/` pulls what the adapters read into `sessions` and `events`** and owns every write to them (`src/sync/AGENTS.md`).
 - **`src/database.ts` owns the schema,** and `drizzle/` holds its generated migrations.
 - **`src/utils.ts` holds `askClaude`,** the `claude -p` runner.
 - **`src/cli/` parses arguments and runs the commands** (`src/cli/AGENTS.md`).
