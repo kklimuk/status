@@ -1,0 +1,23 @@
+#!/bin/sh
+# fact: git passes <previous HEAD> <new HEAD> <branch flag>, and the previous HEAD is all zeros on a fresh checkout.
+case "$1" in
+*[!0]*) exit 0 ;;
+esac
+
+git_dir=$(git rev-parse --absolute-git-dir)
+common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+[ "$git_dir" = "$common_dir" ] && exit 0
+
+worktree=$(git rev-parse --show-toplevel)
+cd "$worktree" || exit 1
+
+if ! grep -q '^STATUS_HOME=' .env 2>/dev/null; then
+	printf 'STATUS_HOME="%s/.status"\n' "$worktree" >>.env
+fi
+
+if ! bun install --frozen-lockfile; then
+	echo "status: bun install failed in $worktree" >&2
+	exit 1
+fi
+
+echo "status: worktree ready at $worktree (STATUS_HOME=$worktree/.status)"
