@@ -1,47 +1,38 @@
-import { parseArgs } from "util";
+import type { App } from "@src/app";
+import { STATUS_USAGE, status } from "./commands/status";
+import { SUMMARIES_USAGE, summaries } from "./commands/summaries";
+import { type CommandResult, failure, usage } from "./utils";
 
-export function run(args: string[]): CommandResult {
-	const parsed = parseCommandLine(args);
-	if ("error" in parsed) {
-		return failure(parsed.error);
+export async function run(
+	args: string[],
+	openApp: () => App,
+): Promise<CommandResult> {
+	const [name, ...rest] = args;
+	if (name === "--help" || name === "-h") {
+		return { output: usage(STATUS_USAGE, SUMMARIES_USAGE), exitCode: 0 };
 	}
-	const [command] = parsed.positionals;
-	if (command !== undefined) {
-		return failure(`unknown command "${command}"`);
+	if (name === "summaries") {
+		return runCommand(summaries, rest, openApp);
 	}
-	return { output: usage(), exitCode: 0 };
+	if (name === undefined || name.startsWith("-")) {
+		return runCommand(status, args, openApp);
+	}
+	return failure(
+		`unknown command "${name}"`,
+		usage(STATUS_USAGE, SUMMARIES_USAGE),
+	);
 }
 
-function parseCommandLine(args: string[]) {
+async function runCommand(
+	command: Command,
+	args: string[],
+	openApp: () => App,
+): Promise<CommandResult> {
 	try {
-		return parseArgs({ args, options: OPTIONS, allowPositionals: true });
+		return await command(args, openApp);
 	} catch (error) {
-		return { error: error instanceof Error ? error.message : String(error) };
+		return failure(error instanceof Error ? error.message : String(error));
 	}
 }
 
-function failure(message: string): CommandResult {
-	return {
-		output: `${colorize("status:", "error")} ${message}\n\n${usage()}`,
-		exitCode: 1,
-	};
-}
-
-function usage(): string {
-	return `${colorize("usage:", "heading")} status [--help]`;
-}
-
-function colorize(text: string, tone: Tone): string {
-	const code = Bun.color(TONES[tone], "ansi");
-	return code ? `${code}${text}${RESET}` : text;
-}
-
-type CommandResult = { output: string; exitCode: number };
-
-type Tone = keyof typeof TONES;
-
-const OPTIONS = { help: { type: "boolean", short: "h" } } as const;
-
-const TONES = { heading: "#3e9eff", error: "#e5484d" };
-
-const RESET = "\x1b[0m";
+type Command = (args: string[], openApp: () => App) => Promise<CommandResult>;

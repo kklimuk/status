@@ -11,13 +11,19 @@ common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
 worktree=$(git rev-parse --show-toplevel)
 cd "$worktree" || exit 1
 
-if ! grep -q '^STATUS_HOME=' .env 2>/dev/null; then
-	printf 'STATUS_HOME="%s/.status"\n' "$worktree" >>.env
-fi
-
 if ! bun install --frozen-lockfile; then
 	echo "status: bun install failed in $worktree" >&2
 	exit 1
 fi
 
-echo "status: worktree ready at $worktree (STATUS_HOME=$worktree/.status)"
+if [ ! -f src/app.ts ]; then
+	echo "status: worktree ready at $worktree"
+	exit 0
+fi
+
+if ! database=$(bun -e 'const { createApp } = await import("./src/app"); const app = createApp(process.env); app.database.$client.close(); process.stdout.write(app.database.$client.filename);'); then
+	echo "status: could not create the worktree's database in $worktree" >&2
+	exit 1
+fi
+
+echo "status: worktree ready at $worktree (database: $database)"
