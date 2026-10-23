@@ -24,7 +24,11 @@ test("askClaude sends the input on stdin with MCP servers and tools off, and cou
 	);
 	const args = await claude.args();
 
-	expect(response).toEqual({ output: { done: true }, inputTokens: 1235 });
+	expect(response).toEqual({
+		output: { done: true },
+		inputTokens: 1235,
+		largestPromptTokens: 1235,
+	});
 	expect(await claude.stdin()).toBe(REQUEST.input);
 	expect(args).toContain("--strict-mcp-config");
 	expect(args).toContain("--no-session-persistence");
@@ -32,6 +36,32 @@ test("askClaude sends the input on stdin with MCP servers and tools off, and cou
 	expect(flag(args, "--setting-sources")).toEqual(["--setting-sources", ""]);
 	expect(flag(args, "--tools")).toEqual(["--tools", ""]);
 	expect(flag(args, "--effort")).toEqual(["--effort", "medium"]);
+});
+
+test("a call the CLI retried bills every request but reports its largest prompt on its own", async () => {
+	const claude = await createFakeClaude({
+		stdout: JSON.stringify({
+			is_error: false,
+			structured_output: { done: true },
+			usage: {
+				input_tokens: 4,
+				cache_read_input_tokens: 6484,
+				cache_creation_input_tokens: 1371,
+				iterations: [
+					{
+						input_tokens: 2,
+						cache_read_input_tokens: 3242,
+						cache_creation_input_tokens: 1371,
+					},
+				],
+			},
+		}),
+	});
+
+	const response = await askClaude(REQUEST, claude.executable);
+
+	expect(response.inputTokens).toBe(7859);
+	expect(response.largestPromptTokens).toBe(4615);
 });
 
 test("a non-zero exit fails closed with the CLI's reason", async () => {

@@ -27,6 +27,7 @@
   `createApp(environment)` builds it and opens `<status>/status.db`.
 - **`src/harnesses/` owns the session contract** and one adapter per harness (`src/harnesses/AGENTS.md`).
 - **`src/sync/` pulls what the adapters read into `sessions` and `events`** and owns every write to them (`src/sync/AGENTS.md`).
+- **`src/summaries/` keeps one rolling Haiku summary per root session,** with its subagents folded in, and owns every read and write of `summaries` (`src/summaries/AGENTS.md`).
 - **`src/database.ts` owns the schema,** and `drizzle/` holds its generated migrations.
 - **`src/utils.ts` holds `askClaude`,** the `claude -p` runner.
 - **`src/cli/` parses arguments and runs the commands** (`src/cli/AGENTS.md`).
@@ -48,7 +49,11 @@
 
 ## Calling Claude
 
-- **`askClaude` runs `claude -p` with the input on stdin** and returns `.structured_output` plus the call's input tokens: `input_tokens`, cache reads and cache writes added together. On a cached prompt, `input_tokens` alone is a handful.
+- **`askClaude` runs `claude -p` with the input on stdin** and returns `.structured_output` plus two token counts, each `input_tokens`, cache reads and cache writes added together. On a cached prompt, `input_tokens` alone is a handful.
+  - **`inputTokens` is what the call billed:** the CLI's top-level `usage`, which sums every API request the call made.
+  - **`largestPromptTokens` is the largest single prompt it sent:** the last entry of `usage.iterations`. That entry is the call's last request, and it carries every earlier turn, so it's the largest. When `iterations` is absent, it falls back to `inputTokens`.
+  - **The two differ when the CLI retries.** A `StructuredOutput` answer that fails the `--json-schema` check goes back to the model as a tool error, and the CLI sends the whole prompt again, so `usage` counts it twice. One summary call saw requests of 3,244 and 4,615 tokens and a `usage` of 7,859.
+  - **Haiku's 100,000-token price tier applies per request,** so compare `largestPromptTokens` against it, not `inputTokens`.
 - **`--strict-mcp-config` is essential.** Without it, every call loads every configured MCP server's tool definitions: about 115k tokens of overhead on a one-sentence input, against about 1.1k with it.
 - **`--setting-sources ""` keeps the caller's project out of the call.** Without it, `claude -p` loads the `CLAUDE.md` and `AGENTS.md` of the directory `status` runs from and every parent, plus settings hooks and plugins. From inside this repo that added about 4.5k tokens to a one-line call, and the project's rules would steer the summaries. A hook that runs `status` could even recurse. The OAuth login still works with it.
 - **Never pass `--bare`.** It skips the OAuth login and fails with "Not logged in".

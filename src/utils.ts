@@ -9,6 +9,7 @@ export type ClaudeRequest = {
 export type ClaudeResponse = {
 	output: unknown;
 	inputTokens: number;
+	largestPromptTokens: number;
 };
 
 export async function askClaude(
@@ -43,12 +44,11 @@ export async function askClaude(
 	if (result.structured_output === undefined) {
 		throw new Error("claude -p returned no structured output");
 	}
+	const usage = result.usage ?? {};
 	return {
 		output: result.structured_output,
-		inputTokens:
-			(result.usage?.input_tokens ?? 0) +
-			(result.usage?.cache_read_input_tokens ?? 0) +
-			(result.usage?.cache_creation_input_tokens ?? 0),
+		inputTokens: countInputTokens(usage),
+		largestPromptTokens: countInputTokens(usage.iterations?.at(-1) ?? usage),
 	};
 }
 
@@ -74,6 +74,14 @@ function claudeArguments(request: ClaudeRequest): string[] {
 	];
 }
 
+function countInputTokens(usage: TokenUsage): number {
+	return (
+		(usage.input_tokens ?? 0) +
+		(usage.cache_read_input_tokens ?? 0) +
+		(usage.cache_creation_input_tokens ?? 0)
+	);
+}
+
 function parseResult(stdout: string): ClaudeResult {
 	try {
 		return JSON.parse(stdout);
@@ -87,11 +95,13 @@ type ClaudeResult = {
 	subtype?: string;
 	result?: string;
 	structured_output?: unknown;
-	usage?: {
-		input_tokens?: number;
-		cache_read_input_tokens?: number;
-		cache_creation_input_tokens?: number;
-	};
+	usage?: TokenUsage & { iterations?: TokenUsage[] };
+};
+
+type TokenUsage = {
+	input_tokens?: number;
+	cache_read_input_tokens?: number;
+	cache_creation_input_tokens?: number;
 };
 
 const TIMEOUT_MS = 10 * 60_000;
