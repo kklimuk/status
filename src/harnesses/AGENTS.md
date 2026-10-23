@@ -74,3 +74,43 @@ Checked against `~/.claude` on 2026-10-23 (Claude Code 2.1.309): 28 root transcr
 - **`status` maps `busy` and `shell` to `busy`, and `idle` and `waiting` to `idle`.** Claude's UI shows `busy` and `shell` as working and `waiting` (a permission prompt or dialog) as blocked. A torn or unreadable file, or one without a positive integer `pid`, is skipped: `kill(0, 0)` signals the caller's own process group and would always look alive.
 - **A live session's `cwd` is its transcript's latest `cwd`, and its branch comes from `git -C <cwd> branch --show-current`.** The pid file's `cwd` is where the session started and never moves; one transcript here passes through 31 directories as the session moves between worktrees.
 - **A subagent is `busy` while its parent's pid file is live (busy or idle), its meta isn't `finished: true`, and its transcript changed in the last 2 minutes.** A background subagent keeps working while its parent sits idle, so a busy parent isn't required. A subagent quiet for over 2 minutes (a long test run, say) shows as ended until it writes again.
+
+## Codex
+
+Checked against 306 rollouts from Codex CLI 0.150 to 0.164, on 2026-10-23.
+- **Sources:** `<codex>/sessions/**/rollout-*.jsonl`. The first line is `session_meta`; a file whose first line isn't one with `id`, `timestamp` and `cwd` fails its read. A rollout that disappears between the scan and its `stat` (archiving moves it out of `sessions/`) isn't listed.
+- **Every line carries an `ordinal`,** its index in the file. Keys are the payload's `call_id` for tool calls and results, and its `id` (`msg_…`, `amsg_…`) for messages, so a result always matches a call stored by an earlier read.
+- **Skipped sources:** `thread_source: guardian_review` (about a third of all rollouts).
+- **Subagents** (`thread_source: subagent`, `source.subagent.thread_spawn.parent_thread_id`) start with a copy of the parent's history: a second `session_meta` and the parent's messages. Lines with `ordinal` below `session_meta.subagent_history_start_ordinal` are that copy and are skipped.
+- **Title and branch** come from `state_5.sqlite`'s `threads`, opened read-only: `name` is the generated title (`title` there is only the first prompt, injected text included), `git_branch` the branch. Subagents have no `name`. Without the database, the read keeps the stored values, falls back to `session_meta.git.branch`, and warns.
+  - **The database is in WAL mode, and Codex removes its `-wal` and `-shm` files when nothing has it open.** A read-only connection can't open it then ("unable to open database file"), so the read retries with `immutable=1`: with no `-wal` file, the main file holds every committed row.
+- **`cwd`** is the latest `turn_context.cwd`, starting from `session_meta.cwd`.
+
+### What becomes an event
+
+- `response_item` `message` with role `user` or `assistant`, `function_call`, `custom_tool_call`, and their `_output` items. Every other `response_item` (`reasoning`, `additional_tools`) and every other line type (`event_msg`, `turn_context`, `world_state`, `compacted`, `token_usage_record`, `inter_agent_communication_metadata`, `session_meta`) is skipped.
+- **Injected content kept out of `message` events.** Codex writes all of this as messages; none of it is what anyone said:
+  - every `developer` message (permissions, skills, multi-agent role, collaboration mode);
+  - user content parts that start with `<environment_context>`, `<codex_internal_context` (goal continuation), `# AGENTS.md instructions for`, or the `<image …>` / `</image>` wrappers around an attached image;
+  - the ambient-UI prefix (`<in-app-browser-context>`, `# Chrome tabs:`) before `\n## My request:\n`; only what follows is kept.
+  - `<send_user_message_question_reply>` is kept: it's the user's answers to a question.
+- **`agent_message`** is how agents talk. In a subagent it's the task or a follow-up from its parent, stored as a `user` message. The payload is encrypted, so only the plaintext header survives (`Message Type: NEW_TASK`, `Task name: /root/<name>`), followed by `[encrypted payload]`. In a root session it's a subagent's report, already in the subagent's own rollout, so it's skipped.
+- **Tools:** almost every call is `custom_tool_call` `exec`, a JavaScript cell that calls `tools.<name>(…)`. The adapter names the call after what it does: `apply_patch` with the `*** Add|Update|Delete File:` paths, else `exec_command` with each `cmd`, else the first `tools.<name>` with any `path`. A `function_call` keeps its `name` (`mcp__<server>__<name>` for MCP) and takes its target from `cmd`, `command`, `path`, `task_name`, `target` or `query`.
+
+### Tool outcomes
+
+- Outputs are a string or a list of `input_text` parts. An `exec` output's first part is `Script completed`, `Script running with cell ID …` (still running in the background), or `Script failed`.
+- **`ok`:** `Script completed` or `Script running`, unless a later JSON part has a non-zero `exit_code` or `isError: true`, which makes it `error`.
+- **`denied`:** `exec command rejected by user`, `patch rejected by user`, `user rejected MCP tool call` (strings from the Codex binary; no user rejection appears on this machine), or the guardian's `Rejected("This action was rejected due to unacceptable risk.…")`. Only the first 2,000 characters of a not-completed output are checked.
+- **`error`:** `Script failed`, `aborted by user after …` (the user interrupted it), or a non-JSON first line containing `failed`.
+
+### Liveness
+
+- **A live thread holds `<codex>/thread-writer-locks/<threadId>.lock` open.** `codex exec` deletes it on exit. `snapshot` lists the lock files and runs one `lsof -w` over them; a lock file nobody holds is stale. lsof exits 1 whenever one lock is unheld, so only stderr marks a failure: `-w` keeps its warnings about unrelated mounts off stderr, and a lock deleted between the scan and `lsof` (a `status error … No such file or directory`) is a thread that just ended.
+- **The TUI, VS Code and the desktop app run threads inside the shared `codex app-server` daemon,** which holds the lock and the rollout, not the client. The daemon keeps a thread loaded after its TUI exits (still held 12 minutes later), so a closed TUI session can show as `idle` until the daemon unloads it.
+- **Busy or idle** comes from the rollout's last turn marker, read backwards from the end: `event_msg` `task_started` is busy; `task_complete` or `turn_aborted` is idle.
+- **Live branch** is `git branch --show-current` in the live `cwd`; a detached `HEAD` is `null`. When git can't answer (no repository, empty `cwd`), the stored branch stands.
+
+### Self-identification
+
+- Commands Codex runs get `CODEX_THREAD_ID=<threadId>` (and `CODEX_SESSION_ID`, the same value for a root thread) in their environment, so `status summaries` can leave out `codex:$CODEX_THREAD_ID`.
