@@ -200,7 +200,7 @@ test("unparseable lines are skipped with a warning", async () => {
 	expect(read?.warnings).toEqual([`skipped 1 unparseable lines in ${path}`]);
 });
 
-test("tool calls become headlines, and their results carry ok, error or denied", async () => {
+test("tool calls become headlines, and their results carry ok, error or user_denied", async () => {
 	const { claude } = createTemporaryHome();
 	const path = transcriptPath(claude);
 	await writeLines(path, [
@@ -245,26 +245,42 @@ test("tool calls become headlines, and their results carry ok, error or denied",
 		{ kind: "tool_call", key: "t4", text: "TaskStop", toolTarget: null },
 		{ kind: "tool_result", key: "t1", toolStatus: "ok" },
 		{ kind: "tool_result", key: "t2", toolStatus: "error" },
-		{ kind: "tool_result", key: "t3", toolStatus: "denied" },
-		{ kind: "tool_result", key: "t4", toolStatus: "denied" },
+		{ kind: "tool_result", key: "t3", toolStatus: "user_denied" },
+		{ kind: "tool_result", key: "t4", toolStatus: "user_denied" },
 	]);
 });
 
-test("an automatic permission denial is an error, not a user rejection", async () => {
+test("a refusal by the auto-mode classifier or the safety check is auto_denied", async () => {
 	const { claude } = createTemporaryHome();
 	const path = transcriptPath(claude);
 	await writeLines(path, [
 		assistantLine([toolUse("t1", "Bash", { command: "cat ~/.ssh/id" })]),
+		assistantLine([toolUse("t2", "Bash", { command: "rm -rf ~" })]),
+		assistantLine([toolUse("t3", "Bash", { command: "ls" })]),
 		toolResultLine("t1", {
 			is_error: true,
 			content:
-				"Permission for this action was denied by the Claude Code auto mode classifier.",
+				"Permission for this action was denied by the Claude Code auto mode classifier. Reason: too risky.",
+		}),
+		toolResultLine("t2", {
+			is_error: true,
+			content:
+				"Permission for this command was denied by a built-in Claude Code safety check, not by the user.",
+		}),
+		toolResultLine("t3", {
+			is_error: true,
+			content:
+				"Exit code 1\nPermission for this action was denied by the Claude Code auto mode classifier.",
 		}),
 	]);
 
 	const read = await createClaudeAdapter(claude).readSource(path, null);
 
-	expect(read?.events[1]).toMatchObject({ toolStatus: "error" });
+	expect(read?.events.slice(3)).toMatchObject([
+		{ key: "t1", toolStatus: "auto_denied" },
+		{ key: "t2", toolStatus: "auto_denied" },
+		{ key: "t3", toolStatus: "error" },
+	]);
 });
 
 test("only what the user or the assistant actually said becomes a message", async () => {

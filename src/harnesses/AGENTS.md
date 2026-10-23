@@ -25,7 +25,7 @@
 - **`key` is unique within its session and stable across re-reads.** Derive it from the transcript: an entry's uuid, a tool call's id, or a line's byte offset. Never derive it from read order.
 - **`message`** is user or assistant text, in full.
 - **`tool_call`** is stored as `pending`. Its `text` is a headline (the tool name and its target), and `toolTarget` is the file path, command, URL or pattern the call acted on. A call that edits several files (Codex `apply_patch`) lists them in `toolTarget`, one per line.
-- **`tool_result`** reuses its call's `key` and carries only the outcome: `ok`, `error`, or `denied` when the user rejected the call. It can arrive in a later read than its call. Sync updates the stored call's `tool_status` in place and never resets a finished call to `pending`.
+- **`tool_result`** reuses its call's `key` and carries only the outcome: `ok`, `error`, `user_denied` when a person rejected the call, or `auto_denied` when an automatic reviewer refused it. `user_denied` means don't ask the user to approve it again; `auto_denied` means the agent may need the user's manual approval or another approach. It can arrive in a later read than its call. Sync updates the stored call's `tool_status` in place and never resets a finished call to `pending`.
 
 ## `snapshot(sessions)`
 
@@ -57,12 +57,15 @@ Checked against `~/.claude` on 2026-10-23 (Claude Code 2.1.309): 28 root transcr
 ### Events
 
 - **Each assistant line holds one content block.** `text` becomes a `message` keyed by the line's `uuid`; `tool_use` becomes a `tool_call` keyed by its `id`; `thinking` is skipped, and so are synthetic `isApiErrorMessage` lines ("API Error: …").
-- **A `tool_result` block is `error` when `is_error` is set, and `denied` when its text starts with `The user doesn't want to `.** Claude writes "…proceed with this tool use" for a rejected call and "…take this action right now" for one interrupted at the prompt. Denials by the auto-mode classifier or the safety check ("Permission for this … was denied by …") are `error`: no user rejected them.
+- **A `tool_result` block is `error` when `is_error` is set, with two exceptions decided by how its text starts:**
+  - `user_denied`: `The user doesn't want to `. Claude writes "…proceed with this tool use" for a rejected call and "…take this action right now" for one interrupted at the prompt.
+  - `auto_denied`: `Permission for this action was denied by the Claude Code auto mode classifier` (followed by "Reason: …") or `Permission for this command was denied by a built-in Claude Code safety check` (followed by "not by the user", for removals that could delete far more than intended). Both appear in real transcripts.
+  - The text must start with the marker, so a failed command whose output quotes one stays `error`.
 - **The tool target is the first of `file_path`, `notebook_path`, `command`, `url` and `pattern`;** the headline is the tool name and the target's first line.
 - **A user line is the user's words only when** it has no `isMeta`, `isCompactSummary` or `isVisibleInTranscriptOnly`, and its `origin` is absent or `kind: human`. That skips skill bodies, system reminders, compaction summaries, peer and coordinator messages, and task notifications.
 - **Within those, text that starts with an injected tag is skipped:** `<command-*>` (slash-command wrappers), `<local-command-*>`, `<bash-*>` (`!` shell input and output), `<ide_*>`, `<browser_instruction>`, `<system-reminder>`, `<task-notification>`, and a bare `[Request interrupted by user]`. Two are kept on purpose:
   - `<pasted_content>`, because it's what the user pasted;
-  - `[Request interrupted by user for tool use]`, which follows a rejected call's `denied` result. A result only updates its call's row in place, and summaries find new events by id, so this line is how they see the denial.
+  - `[Request interrupted by user for tool use]`, which follows a rejected call's `user_denied` result. A result only updates its call's row in place, and summaries find new events by id, so this line is how they see the denial.
 - **A message typed while Claude is busy appears only as an `attachment` line** of type `queued_command`, with `commandMode: prompt` and `origin.kind: human`. Its `prompt` is a string or content blocks, and its text becomes a user `message` keyed by the attachment's `uuid`.
 - **A subagent's first user message is its task,** written by its parent. Workflow agents get two: `[Workflow harness — user request]` and `[Workflow harness — computed task]`.
 - **Every other line type is skipped:** `attachment` (apart from queued prompts), `system`, `api-request*`, `file-history-*`, `last-prompt`, `queue-operation`, `mode`, `permission-mode`, `atis-latch`, `cost-state`, `pr-link` and `continued-in`.
@@ -101,7 +104,10 @@ Checked against 306 rollouts from Codex CLI 0.150 to 0.164, on 2026-10-23.
 
 - Outputs are a string or a list of `input_text` parts. An `exec` output's first part is `Script completed`, `Script running with cell ID …` (still running in the background), or `Script failed`.
 - **`ok`:** `Script completed` or `Script running`, unless a later JSON part has a non-zero `exit_code` or `isError: true`, which makes it `error`.
-- **`denied`:** `exec command rejected by user`, `patch rejected by user`, `user rejected MCP tool call` (strings from the Codex binary; no user rejection appears on this machine), or the guardian's `Rejected("This action was rejected due to unacceptable risk.…")`. Only the first 2,000 characters of a not-completed output are checked.
+- **Refusals are read from a reason at a fixed place, never searched for in output.** For `Script failed`, the last part reads ``Script error:\nexec_command failed for `<cmd>`: CreateProcess { message: "Rejected(\"<reason>…``, and the reason is what follows `Rejected(\"`. It's the second part when the cell printed nothing first; the error comes after any output the cell produced before the refused call. For any other not-completed output, the reason is its first part, minus a leading `Rejected("`. Marker text inside a command or its output is never a refusal.
+- **`user_denied`:** the reason starts with `exec command rejected by user`, `patch rejected by user`, `user rejected MCP tool call` or `rejected by user` (strings from the Codex binary). No user rejection appears on this machine, so how one is wrapped inside an exec cell is unverified; the `CreateProcess` shape is assumed from the guardian's.
+- **`auto_denied`:** the reason starts with the guardian's `This action was rejected due to unacceptable risk`. All 6 real ones are `exec_command` cells in the `CreateProcess` shape.
+- **Sandbox and approval-policy refusals stay `error` (or `ok`).** "Network access was denied by the Codex sandbox network proxy" and "rejected by user approval settings" are in the binary, but neither appears as a tool output on this machine.
 - **`error`:** `Script failed`, `aborted by user after …` (the user interrupted it), or a non-JSON first line containing `failed`.
 
 ### Liveness

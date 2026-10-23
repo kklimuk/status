@@ -76,4 +76,9 @@ export type Surface = "cli" | "vscode" | "app" | "unknown";
 
 export type SessionState = "busy" | "idle" | "ended";
 
-export type ToolStatus = "pending" | "ok" | "error" | "denied";
+export type ToolStatus =
+	| "pending"
+	| "ok"
+	| "error"
+	| "user_denied"
+	| "auto_denied";

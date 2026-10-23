@@ -169,7 +169,7 @@ test("a single-quoted command is unescaped the way JavaScript reads it", async (
 	]);
 });
 
-test("tool results reuse the call's key and carry ok, error or denied", async () => {
+test("tool results reuse the call's key and carry ok, error, user_denied or auto_denied", async () => {
 	const home = createTemporaryHome();
 	writeStateDatabase(home.codex, []);
 	const path = await writeRollout(home.codex, PARENT, [
@@ -181,10 +181,30 @@ test("tool results reuse the call's key and carry ok, error or denied", async ()
 			"guardian",
 			scriptOutput(
 				"Script failed",
-				'Script error:\nexec_command failed: Rejected("This action was rejected due to unacceptable risk.")',
+				'Script error:\nexec_command failed for `rm -rf build`: CreateProcess { message: "Rejected(\\"This action was rejected due to unacceptable risk.\\nReason: too broad.\\")" }',
 			),
 		),
+		customOutput("after-output", [
+			...scriptOutput("Script failed", "build/ removed from the index"),
+			{
+				type: "input_text",
+				text: 'Script error:\nexec_command failed for `rm -rf build`: CreateProcess { message: "Rejected(\\"This action was rejected due to unacceptable risk.\\")" }',
+			},
+		]),
+		customOutput(
+			"user-cell",
+			scriptOutput(
+				"Script failed",
+				'Script error:\nexec_command failed for `git push`: CreateProcess { message: "Rejected(\\"exec command rejected by user\\")" }',
+			),
+		),
+		functionOutput(
+			"guardian-function",
+			'Rejected("This action was rejected due to unacceptable risk.")',
+		),
 		functionOutput("user", "exec command rejected by user"),
+		functionOutput("patch", "patch rejected by user"),
+		functionOutput("mcp", "user rejected MCP tool call"),
 		functionOutput("aborted", "aborted by user after 3.2s"),
 		functionOutput("wait", '{"message":"Wait completed.","timed_out":false}'),
 	]);
@@ -199,10 +219,53 @@ test("tool results reuse the call's key and carry ok, error or denied", async ()
 		["ok", "ok"],
 		["exit", "error"],
 		["failed", "error"],
-		["guardian", "denied"],
-		["user", "denied"],
+		["guardian", "auto_denied"],
+		["after-output", "auto_denied"],
+		["user-cell", "user_denied"],
+		["guardian-function", "auto_denied"],
+		["user", "user_denied"],
+		["patch", "user_denied"],
+		["mcp", "user_denied"],
 		["aborted", "error"],
 		["wait", "ok"],
+	]);
+});
+
+test("refusal text inside a command or its output is not a refusal", async () => {
+	const home = createTemporaryHome();
+	writeStateDatabase(home.codex, []);
+	const path = await writeRollout(home.codex, PARENT, [
+		meta(PARENT),
+		customOutput(
+			"command",
+			scriptOutput(
+				"Script failed",
+				"Script error:\nexec_command failed for `grep 'patch rejected by user' log`: CreateProcess { message: \"spawn failed\" }",
+			),
+		),
+		customOutput(
+			"output",
+			scriptOutput("Script completed", {
+				exit_code: 1,
+				output: "This action was rejected due to unacceptable risk",
+			}),
+		),
+		functionOutput(
+			"function",
+			"git push failed\nremote: exec command rejected by user",
+		),
+	]);
+
+	const read = await createCodexAdapter(home.codex).readSource(path, null);
+
+	expect(
+		read?.events.map((event) =>
+			event.kind === "tool_result" ? [event.key, event.toolStatus] : null,
+		),
+	).toEqual([
+		["command", "error"],
+		["output", "error"],
+		["function", "error"],
 	]);
 });
 

@@ -341,14 +341,28 @@ function toolStatus(payload: Payload): Exclude<ToolStatus, "pending"> {
 	) {
 		return parts.slice(1).some(reportsFailure) ? "error" : "ok";
 	}
-	if (DENIAL.test(parts.join("\n").slice(0, DENIAL_WINDOW))) {
-		return "denied";
+	const refusal = refusalReason(parts);
+	if (refusal.startsWith(GUARDIAN_REJECTION)) {
+		return "auto_denied";
+	}
+	if (USER_REJECTION.test(refusal)) {
+		return "user_denied";
 	}
 	const firstLine = first.split("\n")[0] ?? "";
 	if (!/^[[{]/.test(firstLine) && FAILURE_LINE.test(firstLine)) {
 		return "error";
 	}
 	return "ok";
+}
+
+function refusalReason(parts: string[]): string {
+	const first = parts[0] ?? "";
+	if (!first.startsWith("Script failed")) {
+		return first.replace(REJECTED_WRAPPER, "");
+	}
+	const error = parts.at(-1) ?? "";
+	const wrapper = SCRIPT_REJECTION.exec(error);
+	return wrapper ? error.slice(wrapper[0].length) : "";
 }
 
 function outputParts(output: unknown): string[] {
@@ -584,9 +598,14 @@ const FUNCTION_TARGET_KEYS = [
 ];
 const JS_ESCAPES: Record<string, string> = { n: "\n", r: "\r", t: "\t" };
 
-const DENIAL =
-	/(exec command|patch) rejected by user|user rejected MCP tool call|rejected by user(?! approval settings)|This action was rejected due to unacceptable risk/;
-const DENIAL_WINDOW = 2000;
+// fact: strings from the Codex binary.
+const USER_REJECTION =
+	/^((exec command|patch) rejected by user|user rejected MCP tool call|rejected by user(?! approval settings))/;
+const GUARDIAN_REJECTION = "This action was rejected due to unacceptable risk";
+const REJECTED_WRAPPER = /^Rejected\("/;
+// fact: a refused exec cell's error reads "exec_command failed for `<cmd>`: CreateProcess { message: "Rejected(\"<reason>…", inner quote escaped.
+const SCRIPT_REJECTION =
+	/^Script error:\n\w+ failed for `[\s\S]*?`: CreateProcess \{ message: "Rejected\(\\?"/;
 const FAILURE_LINE = /\bfailed\b|^aborted by user/;
 const VANISHED_LOCK = /^lsof: status error on .+: No such file or directory$/;
 const TURN_LINE =

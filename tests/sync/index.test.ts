@@ -6,6 +6,7 @@ import type {
 	SessionEvent,
 	SessionRecord,
 	SessionSnapshot,
+	ToolStatus,
 } from "@src/harnesses";
 import { sync } from "@src/sync";
 import { createTestApp } from "@tests/utils";
@@ -92,11 +93,11 @@ test("a tool result in a later run updates its pending call in place", async () 
 	await sync(app, SINCE);
 	const [call] = storedEvents(app);
 
-	adapter.append("claude:one", [toolResult("c1", 2, "denied")]);
+	adapter.append("claude:one", [toolResult("c1", 2, "user_denied")]);
 	await sync(app, SINCE);
 
 	expect(storedEvents(app)).toEqual([
-		{ ...call, toolStatus: "denied" } as typeof events.$inferSelect,
+		{ ...call, toolStatus: "user_denied" } as typeof events.$inferSelect,
 	]);
 	expect(storedSession(app, "claude:one")?.lastEventAt).toEqual(atMinute(2));
 });
@@ -449,7 +450,7 @@ function toolCall(key: string, minute: number): SessionEvent {
 function toolResult(
 	key: string,
 	minute: number,
-	toolStatus: "ok" | "error" | "denied" = "ok",
+	toolStatus: Exclude<ToolStatus, "pending"> = "ok",
 ): SessionEvent {
 	return { kind: "tool_result", key, at: atMinute(minute), toolStatus };
 }

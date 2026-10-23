@@ -10,6 +10,7 @@ import type {
 	SessionSnapshot,
 	SessionState,
 	SourceRead,
+	ToolStatus,
 } from ".";
 
 export function createClaudeAdapter(home: string): HarnessAdapter {
@@ -300,12 +301,18 @@ function userEvents(
 	return userMessage(textPieces(content), key, at);
 }
 
-function toolStatusOf(block: ContentBlock): "ok" | "error" | "denied" {
+function toolStatusOf(block: ContentBlock): Exclude<ToolStatus, "pending"> {
 	if (!block.is_error) {
 		return "ok";
 	}
 	const text = textPieces(block.content).join("");
-	return text.startsWith(REJECTION_MARKER) ? "denied" : "error";
+	if (text.startsWith(USER_REJECTION)) {
+		return "user_denied";
+	}
+	if (AUTOMATIC_REFUSALS.some((marker) => text.startsWith(marker))) {
+		return "auto_denied";
+	}
+	return "error";
 }
 
 function textPieces(content: unknown): string[] {
@@ -560,7 +567,13 @@ const TITLE_TYPES = new Set(["custom-title", "agent-name", "ai-title"]);
 const TARGET_KEYS = ["file_path", "notebook_path", "command", "url", "pattern"];
 
 // fact: Claude Code answers a tool call the user rejected with "The user doesn't want to proceed with this tool use…" or "…take this action right now…".
-const REJECTION_MARKER = "The user doesn't want to ";
+const USER_REJECTION = "The user doesn't want to ";
+
+// fact: Claude Code's auto-mode classifier and its built-in safety check refuse a call with these prefixes; the safety check adds "…, not by the user."
+const AUTOMATIC_REFUSALS = [
+	"Permission for this action was denied by the Claude Code auto mode classifier",
+	"Permission for this command was denied by a built-in Claude Code safety check",
+];
 
 const INJECTED_USER_TEXT =
 	/^\s*(<(command-[a-z]+|local-command-[a-z]+|bash-[a-z]+|ide_[a-z_]+|browser_instruction|system-reminder|task-notification)>|\[Request interrupted by user\]\s*$)/;
