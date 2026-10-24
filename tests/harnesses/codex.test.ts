@@ -4,9 +4,18 @@ import {
 	createCodexAdapter,
 	type SessionEvent,
 	type SessionRecord,
+	type SessionSnapshot,
 } from "@src/harnesses";
 import { createTemporaryHome } from "@tests/utils";
-import { closeSync, mkdirSync, openSync, rmSync, utimesSync } from "fs";
+import {
+	closeSync,
+	mkdirSync,
+	openSync,
+	rmSync,
+	symlinkSync,
+	utimesSync,
+} from "fs";
+import { tmpdir } from "os";
 import { join } from "path";
 
 const PARENT = "01a00000-0000-7000-8000-000000000001";
@@ -430,53 +439,243 @@ test("a root session ignores messages other agents send it", async () => {
 	expect(read?.events).toEqual([]);
 });
 
-test("snapshot reports threads whose writer lock is held, busy until the turn ends", async () => {
+test("snapshot asks the daemon for the threads it has loaded", async () => {
 	const home = createTemporaryHome();
-	const busy = await writeRollout(home.codex, PARENT, [
+	const threads = {
+		busy: thread("01a00000-0000-7000-8000-00000000000a", {
+			type: "active",
+			activeFlags: [],
+		}),
+		approval: thread("01a00000-0000-7000-8000-00000000000b", {
+			type: "active",
+			activeFlags: ["waitingOnApproval"],
+		}),
+		question: thread("01a00000-0000-7000-8000-00000000000c", {
+			type: "active",
+			activeFlags: ["waitingOnUserInput"],
+		}),
+		flagged: thread("01a00000-0000-7000-8000-000000000017", {
+			type: "active",
+			activeFlags: ["someFutureFlag"],
+		}),
+		idle: thread("01a00000-0000-7000-8000-00000000000d", { type: "idle" }),
+		broken: thread("01a00000-0000-7000-8000-00000000000e", {
+			type: "systemError",
+		}),
+		unloaded: thread("01a00000-0000-7000-8000-00000000000f", {
+			type: "notLoaded",
+		}),
+		helper: thread(
+			"01a00000-0000-7000-8000-000000000010",
+			{ type: "idle" },
+			"thread_title",
+		),
+	};
+	const daemon = startFakeDaemon(home.codex, Object.values(threads));
+	const records = await Promise.all(
+		Object.values(threads).map(async ({ id }) =>
+			record(id, await writeRollout(home.codex, id, [meta(id)])),
+		),
+	);
+	holdLock(home.codex, threads.unloaded.id);
+
+	const read = await createCodexAdapter(home.codex).snapshot(records);
+
+	expect(states(read.snapshots)).toEqual([
+		[threads.busy.id, "busy"],
+		[threads.approval.id, "waiting"],
+		[threads.question.id, "waiting"],
+		[threads.flagged.id, "busy"],
+		[threads.idle.id, "idle"],
+		[threads.broken.id, "idle"],
+	]);
+	expect(read.warnings).toEqual([]);
+	expect([...new Set(daemon.methods)]).toEqual([
+		"initialize",
+		"initialized",
+		"thread/loaded/list",
+		"thread/read",
+	]);
+	expect(daemon.answeredServerRequest).toBe(false);
+});
+
+test("snapshot falls back to the rollout for a thread held outside the daemon", async () => {
+	const home = createTemporaryHome();
+	startFakeDaemon(home.codex, []);
+	const path = await writeRollout(home.codex, PARENT, [
 		meta(PARENT),
 		line("event_msg", { type: "task_started" }),
 		line("turn_context", { cwd: "/work/repo/live" }),
 	]);
-	const idle = await writeRollout(home.codex, CHILD, [
-		meta(CHILD),
-		line("event_msg", { type: "task_started" }),
-		line("event_msg", { type: "task_complete" }),
-	]);
-	const ended = "01a00000-0000-7000-8000-000000000003";
-	const endedPath = await writeRollout(home.codex, ended, [meta(ended)]);
-	holdLock(home.codex, PARENT);
-	holdLock(home.codex, CHILD);
-	await Bun.write(join(home.codex, "thread-writer-locks", `${ended}.lock`), "");
+	await holdLockInChild(home.codex, PARENT);
 
-	const { snapshots } = await createCodexAdapter(home.codex).snapshot([
-		record(PARENT, busy),
-		record(CHILD, idle),
-		record(ended, endedPath),
+	const read = await createCodexAdapter(home.codex).snapshot([
+		record(PARENT, path),
 	]);
 
-	expect(snapshots).toEqual([
-		{
-			sessionId: `codex:${PARENT}`,
-			state: "busy",
-			cwd: "/work/repo/live",
-			branch: "main",
-		},
-		{
-			sessionId: `codex:${CHILD}`,
-			state: "idle",
-			cwd: "/work/repo",
-			branch: "main",
-		},
+	expect(read).toEqual({
+		snapshots: [
+			{
+				sessionId: `codex:${PARENT}`,
+				state: "busy",
+				cwd: "/work/repo/live",
+				branch: "main",
+			},
+		],
+		warnings: [],
+	});
+});
+
+test("without a daemon, a held lock is live and the rollout's last turn decides the state", async () => {
+	const home = createTemporaryHome();
+	const ids = {
+		busy: "01a00000-0000-7000-8000-000000000011",
+		waiting: "01a00000-0000-7000-8000-000000000012",
+		autoReviewed: "01a00000-0000-7000-8000-000000000013",
+		answered: "01a00000-0000-7000-8000-000000000014",
+		idle: "01a00000-0000-7000-8000-000000000015",
+		unheld: "01a00000-0000-7000-8000-000000000016",
+	};
+	const escalated = customCall("escalated", ESCALATED_INPUT);
+	const rollouts: Record<string, object[]> = {
+		busy: [
+			...openTurn("user"),
+			customCall("plain", 'tools.exec_command({cmd:"ls"})'),
+		],
+		waiting: [...openTurn("user"), escalated],
+		autoReviewed: [...openTurn("auto_review"), escalated],
+		answered: [
+			...openTurn("user"),
+			escalated,
+			customOutput("escalated", scriptOutput("Script completed", "/work")),
+		],
+		idle: [
+			...openTurn("user"),
+			escalated,
+			line("event_msg", { type: "task_complete" }),
+		],
+		unheld: [...openTurn("user")],
+	};
+	const records: SessionRecord[] = [];
+	for (const [name, id] of Object.entries(ids)) {
+		const lines = rollouts[name] ?? [];
+		records.push(
+			record(id, await writeRollout(home.codex, id, [meta(id), ...lines])),
+		);
+		if (name !== "unheld") {
+			holdLock(home.codex, id);
+		}
+	}
+	await Bun.write(
+		join(home.codex, "thread-writer-locks", `${ids.unheld}.lock`),
+		"",
+	);
+
+	const read = await createCodexAdapter(home.codex).snapshot(records);
+
+	expect(states(read.snapshots)).toEqual([
+		[ids.busy, "busy"],
+		[ids.waiting, "waiting"],
+		[ids.autoReviewed, "busy"],
+		[ids.answered, "busy"],
+		[ids.idle, "idle"],
+	]);
+	expect(read.warnings).toEqual([]);
+});
+
+test("snapshot warns and falls back when the daemon's socket can't be reached", async () => {
+	const home = createTemporaryHome();
+	const socket = temporarySocketPath();
+	const server = Bun.serve({
+		unix: socket,
+		fetch: () => new Response("", { status: 503 }),
+	});
+	onTestFinished(() => server.stop(true));
+	linkDaemonSocket(home.codex, socket);
+	const path = await writeRollout(home.codex, PARENT, [
+		meta(PARENT),
+		...openTurn("user"),
+	]);
+	await holdLockInChild(home.codex, PARENT);
+
+	const read = await createCodexAdapter(home.codex).snapshot([
+		record(PARENT, path),
+	]);
+
+	expect(states(read.snapshots)).toEqual([[PARENT, "busy"]]);
+	expect(read.warnings).toEqual([
+		expect.stringContaining("couldn't ask the Codex app-server daemon"),
 	]);
 });
 
-test("snapshot is empty when no thread holds a lock", async () => {
+test("when the daemon's reply is malformed, snapshot warns and counts the daemon's own locks as live", async () => {
+	const home = createTemporaryHome();
+	startFakeDaemon(home.codex, [thread(PARENT, { type: "idle" })], {
+		"thread/loaded/list": { result: { data: "everything" } },
+	});
+	const path = await writeRollout(home.codex, PARENT, [
+		meta(PARENT),
+		...openTurn("user"),
+	]);
+	holdLock(home.codex, PARENT);
+
+	const read = await createCodexAdapter(home.codex).snapshot([
+		record(PARENT, path),
+	]);
+
+	expect(states(read.snapshots)).toEqual([[PARENT, "busy"]]);
+	expect(read.warnings).toEqual([
+		expect.stringContaining(
+			"thread/loaded/list returned no list of thread ids",
+		),
+	]);
+});
+
+test("snapshot is empty when nothing is live", async () => {
 	const home = createTemporaryHome();
 
 	expect(await createCodexAdapter(home.codex).snapshot([])).toEqual({
 		snapshots: [],
 		warnings: [],
 	});
+});
+
+test("aborting a call that asked for escalation is a user rejection", async () => {
+	const home = createTemporaryHome();
+	writeStateDatabase(home.codex, []);
+	const path = await writeRollout(home.codex, PARENT, [
+		meta(PARENT),
+		customCall("escalated", ESCALATED_INPUT),
+		customOutput("escalated", "aborted by user after 3.6s"),
+		customCall("plain", 'text(await tools.exec_command({cmd:"sleep 60"}));'),
+		customOutput("plain", "aborted by user after 12.0s"),
+		customCall(
+			"quoted",
+			'tools.apply_patch(`*** Begin Patch\n*** Add File: a.ts\n+run({sandbox_permissions:"require_escalated"})\n*** End Patch`);',
+		),
+		customOutput("quoted", "aborted by user after 1.0s"),
+		customCall("earlier", ESCALATED_INPUT),
+	]);
+	const adapter = createCodexAdapter(home.codex);
+	const first = await adapter.readSource(path, null);
+	await appendText(
+		path,
+		`${JSON.stringify({ ...customOutput("earlier", "aborted by user after 2.0s"), ordinal: 8 })}\n`,
+	);
+
+	const second = await adapter.readSource(path, {
+		session: first?.session as SessionRecord,
+		readOffset: first?.nextOffset ?? 0,
+	});
+
+	expect(
+		results([...(first?.events ?? []), ...(second?.events ?? [])]),
+	).toEqual([
+		["escalated", "user_denied"],
+		["plain", "error"],
+		["quoted", "error"],
+		["earlier", "user_denied"],
+	]);
 });
 
 function meta(id: string, overrides: Record<string, unknown> = {}) {
@@ -624,6 +823,130 @@ function record(threadId: string, sourcePath: string): SessionRecord {
 	};
 }
 
+function thread(
+	id: string,
+	status: Record<string, unknown>,
+	threadSource = "user",
+) {
+	return { id, status, threadSource };
+}
+
+function openTurn(reviewer: string) {
+	return [
+		line("event_msg", { type: "task_started" }),
+		line("turn_context", { cwd: "/work/repo", approvals_reviewer: reviewer }),
+	];
+}
+
+function startFakeDaemon(
+	codex: string,
+	threads: ReturnType<typeof thread>[],
+	overrides: Record<string, unknown> = {},
+) {
+	const daemon = { methods: [] as string[], answeredServerRequest: false };
+	const path = temporarySocketPath();
+	const server = Bun.serve({
+		unix: path,
+		fetch: (request, server) =>
+			server.upgrade(request) ? undefined : new Response("", { status: 400 }),
+		websocket: {
+			open(socket) {
+				socket.send(
+					JSON.stringify({
+						id: "server-1",
+						method: "item/permissions/requestApproval",
+						params: {},
+					}),
+				);
+			},
+			message(socket, text) {
+				const message = JSON.parse(String(text));
+				if (message.id === "server-1") {
+					daemon.answeredServerRequest = true;
+				}
+				daemon.methods.push(message.method);
+				if (message.id === undefined) {
+					return;
+				}
+				const result =
+					overrides[message.method] ?? daemonResult(threads, message);
+				socket.send(
+					JSON.stringify({ jsonrpc: "2.0", id: message.id, ...result }),
+				);
+			},
+		},
+	});
+	linkDaemonSocket(codex, path);
+	onTestFinished(() => {
+		server.stop(true);
+		rmSync(path, { force: true });
+	});
+	return daemon;
+}
+
+function temporarySocketPath(): string {
+	return join(
+		tmpdir(),
+		`status-daemon-${crypto.randomUUID().slice(0, 8)}.sock`,
+	);
+}
+
+function linkDaemonSocket(codex: string, socket: string) {
+	const control = join(codex, "app-server-control");
+	mkdirSync(control, { recursive: true });
+	symlinkSync(socket, join(control, "app-server-control.sock"));
+}
+
+function daemonResult(
+	threads: ReturnType<typeof thread>[],
+	message: { method: string; params: { threadId?: string } },
+): object {
+	if (message.method === "thread/loaded/list") {
+		const loaded = threads.filter((entry) => entry.status.type !== "notLoaded");
+		return {
+			result: { data: loaded.map((entry) => entry.id), nextCursor: null },
+		};
+	}
+	if (message.method === "thread/read") {
+		const found = threads.find((entry) => entry.id === message.params.threadId);
+		if (!found) {
+			return { error: { code: -32600, message: "thread not loaded" } };
+		}
+		return { result: { thread: found } };
+	}
+	return { result: {} };
+}
+
+async function holdLockInChild(codex: string, threadId: string) {
+	const directory = join(codex, "thread-writer-locks");
+	mkdirSync(directory, { recursive: true });
+	const child = Bun.spawn(
+		[
+			"sh",
+			"-c",
+			'exec 3>>"$1"; echo held; exec sleep 60',
+			"sh",
+			join(directory, `${threadId}.lock`),
+		],
+		{ stdout: "pipe" },
+	);
+	onTestFinished(() => child.kill());
+	await child.stdout.getReader().read();
+}
+
+function states(snapshots: SessionSnapshot[]) {
+	return snapshots.map((snapshot) => [
+		snapshot.sessionId.slice("codex:".length),
+		snapshot.state,
+	]);
+}
+
+function results(events: SessionEvent[]) {
+	return events.flatMap((event) =>
+		event.kind === "tool_result" ? [[event.key, event.toolStatus]] : [],
+	);
+}
+
 function messages(events: SessionEvent[] | undefined) {
 	return (events ?? []).flatMap((event) =>
 		event.kind === "message" ? [[event.role, event.text]] : [],
@@ -631,3 +954,5 @@ function messages(events: SessionEvent[] | undefined) {
 }
 
 const AT = new Date("2026-10-20T10:05:00.000Z");
+const ESCALATED_INPUT =
+	'text(await tools.exec_command({cmd:"pwd",sandbox_permissions:"require_escalated",justification:"Allow this?"}));\n';
