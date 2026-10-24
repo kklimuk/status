@@ -40,7 +40,7 @@ export async function status(
 	app.progress(`grouping ${pluralize(triaged.length, "session")} by goal`);
 	const grouped = await groupByGoal(app, triaged, now);
 	const output = [
-		renderTally(triaged, options.days),
+		renderTally(grouped.goals, options.days),
 		...grouped.goals.map((goal) => renderGoal(goal, now)),
 	].join("\n\n");
 	return finish(
@@ -88,16 +88,16 @@ function triageRoots(database: StatusDatabase, since: Date): Triaged[] {
 				summary,
 				subagents,
 				lastActiveAt,
-				busySubagentObjectives: subagents
-					.filter((subagent) => subagent.state === "busy")
-					.map(
-						(subagent) =>
+				liveSubagents: subagents
+					.filter((subagent) => subagent.state !== "ended")
+					.map((subagent) => ({
+						state: subagent.state,
+						objective:
 							stored.get(subagent.id)?.objective ??
 							subagent.title ??
 							"no summary yet",
-					),
+					})),
 				behind: summary === null || newestEventId > summary.throughEventId,
-				...bucketOf(root.state, summary, subagents),
 			};
 		})
 		.filter((triaged) => triaged.lastActiveAt >= since)
@@ -112,44 +112,6 @@ function descendantsOf(
 		child,
 		...descendantsOf(child.id, childrenByParent),
 	]);
-}
-
-function bucketOf(
-	state: SessionState,
-	summary: SummaryRow | null,
-	subagents: SessionRow[],
-): { bucket: Bucket; reason: string } {
-	if (state === "waiting") {
-		return { bucket: "blocked", reason: "a prompt or question is open" };
-	}
-	if (subagents.some((subagent) => subagent.state === "waiting")) {
-		return {
-			bucket: "blocked",
-			reason: "a subagent's prompt or question is open",
-		};
-	}
-	if (state === "busy") {
-		return { bucket: "running", reason: "the agent is working" };
-	}
-	if (subagents.some((subagent) => subagent.state === "busy")) {
-		return { bucket: "running", reason: "a subagent is working" };
-	}
-	if (summary === null && state === "idle") {
-		return { bucket: "blocked", reason: "idle, with no summary yet" };
-	}
-	if (summary === null) {
-		return { bucket: "finished", reason: "ended, with no summary yet" };
-	}
-	if (summary.outcome !== "in_progress") {
-		return { bucket: "finished", reason: `ended its work: ${summary.outcome}` };
-	}
-	if (state === "idle" && summary.waitingOn === "external") {
-		return { bucket: "running", reason: "idle, waiting on something external" };
-	}
-	if (state === "idle") {
-		return { bucket: "blocked", reason: "its turn ended with work left" };
-	}
-	return { bucket: "blocked", reason: "the session ended with work left" };
 }
 
 async function groupByGoal(
@@ -192,15 +154,14 @@ function renderInput(triaged: Triaged[], now: Date): string {
 		const { session, summary } = item;
 		const lines = [
 			`## ${session.id}`,
-			`bucket: ${item.bucket} (${item.reason})`,
 			`live state: ${session.state}`,
 			`title: ${session.title ?? "none"}`,
 			`directory: ${session.cwd}`,
 			`branch: ${session.branch ?? "none"}`,
-			`last activity: ${formatAge(item.lastActiveAt, now)}`,
-			`subagents: ${item.subagents.length}, ${item.busySubagentObjectives.length} busy`,
-			...item.busySubagentObjectives.map(
-				(objective) => `- busy subagent: ${objective}`,
+			`last activity: ${item.lastActiveAt.toISOString()} (${formatAge(item.lastActiveAt, now)})`,
+			`subagents: ${item.subagents.length}, ${item.liveSubagents.length} not ended`,
+			...item.liveSubagents.map(
+				(subagent) => `- ${subagent.state} subagent: ${subagent.objective}`,
 			),
 		];
 		if (summary === null) {
@@ -239,9 +200,10 @@ function groupingSchema(triaged: Triaged[]): Record<string, unknown> {
 		type: "object",
 		properties: {
 			id: { type: "string", enum: triaged.map((item) => item.session.id) },
+			bucket: { type: "string", enum: BUCKETS },
 			line: text,
 		},
-		required: ["id", "line"],
+		required: ["id", "bucket", "line"],
 		additionalProperties: false,
 	};
 	const goal = {
@@ -287,11 +249,12 @@ function parseGrouping(
 				throw new Error(`the answer lists ${id} more than once`);
 			}
 			seen.add(id);
+			const bucket = requireBucket((entry as { bucket?: unknown })?.bucket);
 			const line = requireText(
 				(entry as { line?: unknown })?.line,
 				"a session's line",
 			);
-			return { ...item, line };
+			return { ...item, bucket, line };
 		}),
 	}));
 	return {
@@ -314,11 +277,22 @@ function requireText(value: unknown, name: string): string {
 	return value.trim();
 }
 
+function requireBucket(value: unknown): Bucket {
+	const bucket = BUCKETS.find((candidate) => candidate === value);
+	if (!bucket) {
+		throw new Error(
+			`the answer gives a bucket that isn't one of ${BUCKETS.join(", ")}: ${JSON.stringify(value)}`,
+		);
+	}
+	return bucket;
+}
+
 function ungrouped(triaged: Triaged[]): Goal {
 	return {
 		name: UNGROUPED_GOAL,
 		sessions: triaged.map((item) => ({
 			...item,
+			bucket: null,
 			line: item.summary?.objective ?? item.session.title ?? "no summary yet",
 		})),
 	};
@@ -335,20 +309,30 @@ function sortGoals(goals: Goal[]): Goal[] {
 
 function urgencyOf(goal: Goal): { rank: number; latest: Date } {
 	return {
-		rank: Math.min(
-			...goal.sessions.map((item) => BUCKETS.indexOf(item.bucket)),
-		),
+		rank: Math.min(...goal.sessions.map((item) => rankOf(item.bucket))),
 		latest: new Date(
 			Math.max(...goal.sessions.map((item) => +item.lastActiveAt)),
 		),
 	};
 }
 
-function renderTally(triaged: Triaged[], days: number): string {
-	const counts = BUCKETS.map((bucket) => {
-		const count = triaged.filter((item) => item.bucket === bucket).length;
-		return colorize(`${count} ${BUCKET_LABELS[bucket]}`, bucket);
-	});
+function rankOf(bucket: Bucket | null): number {
+	return bucket === null ? BUCKETS.length : BUCKETS.indexOf(bucket);
+}
+
+function renderTally(goals: Goal[], days: number): string {
+	const listed = goals.flatMap((goal) => goal.sessions);
+	const judged = listed.some((item) => item.bucket !== null);
+	const counts = judged
+		? BUCKETS.map((bucket) => {
+				const count = listed.filter((item) => item.bucket === bucket).length;
+				return colorize(`${count} ${BUCKET_LABELS[bucket]}`, bucket);
+			})
+		: [];
+	const ungroupedCount = listed.filter((item) => item.bucket === null).length;
+	if (ungroupedCount > 0) {
+		counts.push(`${ungroupedCount} not grouped`);
+	}
 	return `${counts.join(" · ")}  ${colorize(`last ${pluralize(days, "day")}`, "muted")}`;
 }
 
@@ -365,7 +349,10 @@ function renderGoal(goal: Goal, now: Date): string {
 			...members.flatMap((item) => renderSession(item, now)),
 		];
 	});
-	return [colorize(goal.name, "heading"), ...buckets].join("\n");
+	const unbucketed = goal.sessions
+		.filter((item) => item.bucket === null)
+		.flatMap((item) => renderSession(item, now));
+	return [colorize(goal.name, "heading"), ...buckets, ...unbucketed].join("\n");
 }
 
 function renderSession(item: GoalSession, now: Date): string[] {
@@ -398,7 +385,7 @@ function renderSession(item: GoalSession, now: Date): string[] {
 }
 
 function askOf(item: GoalSession): string | null {
-	if (item.bucket !== "blocked") {
+	if (item.bucket === "running" || item.bucket === "finished") {
 		return null;
 	}
 	if (item.summary?.ask) {
@@ -483,14 +470,12 @@ type Triaged = {
 	session: SessionRow;
 	summary: SummaryRow | null;
 	subagents: SessionRow[];
-	busySubagentObjectives: string[];
+	liveSubagents: { state: SessionState; objective: string }[];
 	lastActiveAt: Date;
 	behind: boolean;
-	bucket: Bucket;
-	reason: string;
 };
 
-type GoalSession = Triaged & { line: string };
+type GoalSession = Triaged & { bucket: Bucket | null; line: string };
 
 type Goal = { name: string; sessions: GoalSession[] };
 
@@ -517,9 +502,23 @@ const UNGROUPED_GOAL = "Not grouped";
 
 const BEHIND_NOTE = " (behind: the session has moved on since it was written)";
 
-const SYSTEM_PROMPT = `You prepare a developer's morning triage of their coding-agent sessions (Claude Code and Codex). The input lists each root session active recently: its bucket, live state, directory, branch, last activity and a rolling summary of what it did. Subagents are already folded into their parent's summary.
+const SYSTEM_PROMPT = `You prepare a developer's morning triage of their coding-agent sessions (Claude Code and Codex). The input lists each root session active recently: its live state, directory, branch, last activity, the subagents that haven't ended, and a rolling summary of what it did. Subagents' work is already folded into their parent's summary.
 
-Return goals, each with its sessions, and one line per session.
+Return goals, each with its sessions, and for each session a bucket and one line.
+
+Buckets: judge each session by who has the next move.
+- blocked: the next move is the developer's. They must answer, approve, decide, review, or resume or drop work that stopped partway.
+- running: an agent or something external (a build, CI, a background job, another person) is making progress, and the developer needn't act yet.
+- finished: nothing is left for anyone. The work is delivered or deliberately abandoned, and nothing is proposed or pending.
+
+Live states, as observed just now:
+- waiting: a permission prompt or a question is open in the session right now; someone has to answer it before it continues.
+- busy: the agent is working on a turn right now.
+- idle: the session is open but its turn ended; it continues only when someone sends a message, unless something it started (a background job) wakes it.
+- ended: the process is gone. Nothing runs until the developer resumes it.
+A subagent's state counts toward its root: a waiting subagent holds its root on the same prompt, a busy one is still working for it, and an idle one waits on its root, not on the developer.
+
+Weigh the live state with the summary. The summary's outcome, waiting on, ask, next and blockers say what the session thought was left when its summary was written; the live state and last activity say what's true now. An open ask on an ended session may be stale, or may still be the decision the developer owes: judge from its age and whether later work moved past it. A summary marked behind may lag the session; don't guess past what it says, and lean on the live state.
 
 Goals:
 - A goal is the outcome the developer is pursuing: a feature, a fix, a release, an investigation, a document. Group sessions that serve the same outcome, even across directories, worktrees and harnesses (a coordinator session and the stream sessions it launched for the same project phase share a goal).
@@ -528,10 +527,8 @@ Goals:
 
 Sessions:
 - List every input session exactly once, under one goal, with its id copied exactly from its "##" heading. Never invent an id.
-- The bucket is fixed: it comes from the live state and the summary. Write the line to fit it, and never contradict it.
-- One line, at most about 120 characters, plain language, no session id. Say what the developer needs for that bucket:
-  - blocked: where the work stands and what it needs from the developer. The session's ask is printed under your line verbatim, so don't restate it; give the context that makes it quick to answer. When the session stopped with work left and no ask, say what's left.
+- One line, at most about 120 characters, plain language, no session id, that fits the bucket you chose:
+  - blocked: where the work stands and what the developer needs to do. The session's ask, when it has one, is printed under your line verbatim, so don't restate it; give the context that makes it quick to answer. With no ask, say what's needed.
   - running: what it's doing now.
-  - finished: what it delivered, with commit hashes, PR numbers or file names when the summary has them. When the outcome is abandoned, say so and why.
-- A summary marked behind may lag the session; describe what it does say, without guessing past it.
+  - finished: what it delivered, with commit hashes, PR numbers or file names when the summary has them. When it was abandoned, say so and why.
 - Keep exact identifiers (commands, hashes, file names) when they help; drop narration about the agent ("The agent then...").`;

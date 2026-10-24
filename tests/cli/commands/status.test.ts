@@ -13,13 +13,23 @@ test("sessions are grouped by goal, with buckets ordered blocked, running, finis
 			{
 				name: "Ship the parser",
 				sessions: [
-					{ id: "claude:finished", line: "Merged the parser as abc1234." },
-					{ id: "claude:running", line: "Running the parser's tests." },
+					{
+						id: "claude:finished",
+						bucket: "finished",
+						line: "Merged the parser as abc1234.",
+					},
+					{
+						id: "claude:running",
+						bucket: "running",
+						line: "Running the parser's tests.",
+					},
 				],
 			},
 			{
 				name: "Release notes",
-				sessions: [{ id: "claude:blocked", line: "Draft is ready." }],
+				sessions: [
+					{ id: "claude:blocked", bucket: "blocked", line: "Draft is ready." },
+				],
 			},
 		]),
 	);
@@ -59,45 +69,71 @@ test("sessions are grouped by goal, with buckets ordered blocked, running, finis
 	);
 });
 
-test("the bucket follows the live state, whatever the summary says", async () => {
+test("Opus's bucket stands, even against the live state", async () => {
 	const requests: ClaudeRequest[] = [];
 	const app = createLiveApp(
 		{
-			"claude:busy-done": "busy",
-			"claude:waiting-done": "waiting",
-			"claude:idle-open": "idle",
-			"claude:idle-parent": "idle",
-			"claude:busy-child": "busy",
+			"claude:busy": "busy",
+			"claude:parent": "idle",
+			"claude:child": "waiting",
 		},
 		async (request) => {
 			requests.push(request);
-			return answer([{ name: "Everything", sessions: idsIn(request) }])();
+			return answer([
+				{
+					name: "Everything",
+					sessions: [
+						{ id: "claude:busy", bucket: "finished", line: "Done." },
+						{ id: "claude:ended", bucket: "running", line: "CI runs." },
+						{ id: "claude:parent", bucket: "blocked", line: "Approve." },
+					],
+				},
+			])();
 		},
 	);
-	addRoot(app, "claude:busy-done", {});
-	addSummary(app, "claude:busy-done", { outcome: "done" });
-	addRoot(app, "claude:waiting-done", {});
-	addSummary(app, "claude:waiting-done", { outcome: "done" });
-	addRoot(app, "claude:idle-open", {});
-	addSummary(app, "claude:idle-open", {});
-	addRoot(app, "claude:ended-open", {});
-	addSummary(app, "claude:ended-open", {});
-	addRoot(app, "claude:idle-parent", {});
-	addSummary(app, "claude:idle-parent", { outcome: "done" });
-	addRoot(app, "claude:busy-child", { parentId: "claude:idle-parent" });
+	addRoot(app, "claude:busy", { minutesAgo: 1 });
+	addSummary(app, "claude:busy", {});
+	addRoot(app, "claude:ended", { minutesAgo: 2 });
+	addSummary(app, "claude:ended", { outcome: "done" });
+	addRoot(app, "claude:parent", { minutesAgo: 3 });
+	addSummary(app, "claude:parent", { outcome: "done" });
+	addRoot(app, "claude:child", { parentId: "claude:parent", minutesAgo: 3 });
+	addSummary(app, "claude:child", { objective: "Run the migration" });
 
 	const result = await status([], () => app);
 
+	expect(result.exitCode).toBe(0);
+	expect(Bun.stripANSI(result.output).split("\n")[0]).toBe(
+		"1 blocked on you · 1 running · 1 finished  last 7 days",
+	);
 	expect(bucketsIn(result.output)).toEqual({
-		"blocked on you": [
-			"claude:waiting-done",
-			"claude:idle-open",
-			"claude:ended-open",
-		],
-		running: ["claude:busy-done", "claude:idle-parent"],
+		"blocked on you": ["claude:parent"],
+		running: ["claude:ended"],
+		finished: ["claude:busy"],
 	});
-	expect(idsIn(requests[0] as ClaudeRequest).map(({ id }) => id)).not.toContain(
-		"claude:busy-child",
+	const input = (requests[0] as ClaudeRequest).input;
+	expect(input).not.toContain("## claude:child");
+	expect(input).toContain("- waiting subagent: Run the migration");
+});
+
+test("a bucket that isn't one of the three fails the run", async () => {
+	const app = createLiveApp(
+		{},
+		answer([
+			{
+				name: "Work",
+				sessions: [{ id: "claude:one", bucket: "paused", line: "Paused." }],
+			},
+		]),
+	);
+	addRoot(app, "claude:one", {});
+	addSummary(app, "claude:one", {});
+
+	const result = await status([], () => app);
+
+	expect(result.exitCode).toBe(1);
+	expect(Bun.stripANSI(result.output)).toEndWith(
+		'failed: grouping by goal: the answer gives a bucket that isn\'t one of blocked, running, finished: "paused"',
 	);
 });
 
@@ -107,7 +143,13 @@ test("a waiting session with no ask still says a prompt is open", async () => {
 		answer([
 			{
 				name: "Deploy",
-				sessions: [{ id: "claude:prompted", line: "About to deploy." }],
+				sessions: [
+					{
+						id: "claude:prompted",
+						bucket: "blocked",
+						line: "About to deploy.",
+					},
+				],
 			},
 		]),
 	);
@@ -121,13 +163,19 @@ test("a waiting session with no ask still says a prompt is open", async () => {
 	);
 });
 
-test("a subagent holding a prompt blocks its busy parent", async () => {
+test("a blocked session whose subagent holds a prompt says so", async () => {
 	const app = createLiveApp(
 		{ "claude:parent": "busy", "claude:child": "waiting" },
 		answer([
 			{
 				name: "Migrate",
-				sessions: [{ id: "claude:parent", line: "Running the migration." }],
+				sessions: [
+					{
+						id: "claude:parent",
+						bucket: "blocked",
+						line: "Running the migration.",
+					},
+				],
 			},
 		]),
 	);
@@ -152,8 +200,8 @@ test("an id the grouping made up fails the run and still lists every session", a
 			{
 				name: "Work",
 				sessions: [
-					{ id: "claude:one", line: "Did one." },
-					{ id: "claude:invented", line: "Did nothing." },
+					{ id: "claude:one", bucket: "finished", line: "Did one." },
+					{ id: "claude:invented", bucket: "finished", line: "Did nothing." },
 				],
 			},
 		]),
@@ -165,10 +213,28 @@ test("an id the grouping made up fails the run and still lists every session", a
 
 	expect(result.exitCode).toBe(1);
 	const output = Bun.stripANSI(result.output);
-	expect(output).toContain("Not grouped\n  finished\n    claude:one");
+	expect(output).toStartWith(
+		"1 not grouped  last 7 days\n\nNot grouped\n    claude:one",
+	);
 	expect(output).toContain("      Do one");
 	expect(output).toEndWith(
 		"failed: grouping by goal: the answer names a session that wasn't asked about: claude:invented",
+	);
+});
+
+test("a failed grouping still prints each session's open question", async () => {
+	const app = createLiveApp({ "claude:asking": "waiting" }, rejectCall);
+	addRoot(app, "claude:asking", {});
+	addSummary(app, "claude:asking", {
+		waitingOn: "user",
+		ask: "Publish the draft?",
+	});
+
+	const result = await status([], () => app);
+
+	expect(result.exitCode).toBe(1);
+	expect(Bun.stripANSI(result.output)).toContain(
+		"Not grouped\n    claude:asking  waiting · /work/repo · 5m ago\n      Objective of claude:asking\n      ask: Publish the draft?",
 	);
 });
 
@@ -176,8 +242,14 @@ test("a session listed twice fails the run", async () => {
 	const app = createLiveApp(
 		{},
 		answer([
-			{ name: "One", sessions: [{ id: "claude:one", line: "First." }] },
-			{ name: "Two", sessions: [{ id: "claude:one", line: "Again." }] },
+			{
+				name: "One",
+				sessions: [{ id: "claude:one", bucket: "finished", line: "First." }],
+			},
+			{
+				name: "Two",
+				sessions: [{ id: "claude:one", bucket: "finished", line: "Again." }],
+			},
 		]),
 	);
 	addRoot(app, "claude:one", {});
@@ -195,7 +267,10 @@ test("a session the grouping left out is shown ungrouped, with a warning", async
 	const app = createLiveApp(
 		{},
 		answer([
-			{ name: "Kept", sessions: [{ id: "claude:kept", line: "Kept it." }] },
+			{
+				name: "Kept",
+				sessions: [{ id: "claude:kept", bucket: "finished", line: "Kept it." }],
+			},
 		]),
 	);
 	addRoot(app, "claude:kept", {});
@@ -207,7 +282,10 @@ test("a session the grouping left out is shown ungrouped, with a warning", async
 
 	expect(result.exitCode).toBe(0);
 	const output = Bun.stripANSI(result.output);
-	expect(output).toContain("Not grouped\n  finished\n    claude:left");
+	expect(output).toContain("Not grouped\n    claude:left");
+	expect(output).toStartWith(
+		"0 blocked on you · 0 running · 1 finished · 1 not grouped",
+	);
 	expect(output).toContain("      Left out");
 	expect(output).toEndWith(
 		'warning: the grouping left out claude:left, shown under "Not grouped"',
@@ -218,7 +296,10 @@ test("a summary that hasn't caught up with its session is marked behind", async 
 	const app = createLiveApp(
 		{ "claude:busy": "busy" },
 		answer([
-			{ name: "Work", sessions: [{ id: "claude:busy", line: "Working." }] },
+			{
+				name: "Work",
+				sessions: [{ id: "claude:busy", bucket: "running", line: "Working." }],
+			},
 		]),
 	);
 	addRoot(app, "claude:busy", {});
@@ -273,7 +354,10 @@ test("a failed refresh prints what it has, then the failure, and exits 1", async
 			},
 		],
 		askClaude: answer([
-			{ name: "Work", sessions: [{ id: "claude:one", line: "Did one." }] },
+			{
+				name: "Work",
+				sessions: [{ id: "claude:one", bucket: "finished", line: "Did one." }],
+			},
 		]),
 		now: () => NOW,
 	});
@@ -385,20 +469,15 @@ function answer(goals: { name: string; sessions: SessionLine[] }[]) {
 	});
 }
 
-function idsIn(request: ClaudeRequest): SessionLine[] {
-	return [...request.input.matchAll(/^## (\S+)$/gm)].map((match) => ({
-		id: match[1] as string,
-		line: "A line.",
-	}));
-}
-
 function bucketsIn(output: string): Record<string, string[]> {
 	const buckets: Record<string, string[]> = {};
 	let current = "";
 	for (const line of Bun.stripANSI(output).split("\n")) {
 		const bucket = line.match(/^ {2}(\S.*)$/)?.[1];
 		const session = line.match(/^ {4}(\S+) {2}/)?.[1];
-		if (bucket) {
+		if (/^\S/.test(line)) {
+			current = "";
+		} else if (bucket) {
 			current = bucket;
 			buckets[current] = [];
 		} else if (session) {
@@ -412,6 +491,6 @@ async function rejectCall(): Promise<never> {
 	throw new Error("no call expected");
 }
 
-type SessionLine = { id: string; line: string };
+type SessionLine = { id: string; bucket: string; line: string };
 
 const NOW = new Date("2026-10-23T12:00:00Z");

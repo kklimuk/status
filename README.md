@@ -16,7 +16,7 @@ bun src/index.ts             # sessions active in the last 7 days
 bun src/index.ts --days 2
 ```
 
-It syncs, refreshes the Haiku summaries, then asks Opus to group the root sessions by goal. Each goal lists its sessions under **blocked on you**, **running** and **finished**, with the session's id (for `status summaries --session <id>`), live state, directory, branch and last activity, one line on where it stands, and, when it's blocked on you, the question it's waiting on. It exits 1 when a sync, a summary or the grouping failed, after printing what it has.
+It syncs, refreshes the Haiku summaries, then asks Opus to group the root sessions by goal and judge whether each is blocked on you, running or finished. Each goal lists its sessions under **blocked on you**, **running** and **finished**, with the session's id (for `status summaries --session <id>`), live state, directory, branch and last activity, one line on where it stands, and, when it's blocked on you, the question it's waiting on. It exits 1 when a sync, a summary or the grouping failed, after printing what it has.
 
 ## `status summaries` for agents
 

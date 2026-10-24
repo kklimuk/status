@@ -18,20 +18,20 @@
 ## `status`
 
 The human's morning triage: root sessions active in the `--days` window, grouped by goal, each in a bucket (blocked on you, running, finished) with one line. Subagents are folded into their root.
-- **The bucket is derived in code, not by Opus.** Opus groups sessions into goals and writes the lines; it gets each bucket as a fixed input. The live state is the strongest signal there is, and a second judge could contradict it (a `busy` session called finished, a `waiting` one called running) or contradict the summary that `status summaries` shows for the same session. Derived, the bucket is deterministic and testable. In order:
-  - `waiting`, or any subagent at any depth `waiting`, is blocked: a prompt or question is open. A Codex subagent holds its own approval prompt while its parent stays `busy` waiting on it, so the parent's state alone would call it running.
-  - `busy`, or any subagent at any depth `busy`, is running.
-  - No summary: `idle` is blocked, `ended` is finished.
-  - Summary `done` or `abandoned` is finished.
-  - `idle` and `in_progress` waiting on `external` is running.
-  - Any other `in_progress` is blocked. An `idle` one's turn ended and the next move is the user's; an `ended` one stopped with work left, and only the user can resume or drop it.
+- **Opus picks each session's bucket, and code never overrides it,** not even for `waiting` or `busy`. The user decided this on 2026-10-23 after reading the first version's rule table, which derived the bucket in code from the live state and the summary: they want Opus's judgment, which can weigh an old, unanswered ask on an ended session or a summary that lags the session. The prompt defines the buckets by meaning, by who has the next move:
+  - blocked: the developer's;
+  - running: an agent or something external is making progress;
+  - finished: nothing is left for anyone.
+
+  It also says what each live state means: `waiting` is a prompt or question open now, `busy` is a turn in progress, `idle` is a turn that ended with the session still open, `ended` is a process that's gone. A subagent's state counts toward its root, and an `idle` one (Codex) waits on its root, not the developer.
 - **The window is family activity:** a root is in it when it or any subagent has `last_event_at` within `--days`.
 - **A summary is behind** when the root has none, or when the newest event id across its family is past its `through_event_id`, the same rule `status summaries` uses. That covers deferred and failed summaries alike. Opus is told, and the session shows `summary behind`.
-- **Opus's answer is checked against the input.** The schema lists the input's ids as an enum, so the CLI's schema check sends an invented id back to Opus within the call; the code check is the backstop. An id it wasn't given, or one listed twice, rejects the whole answer: every session is shown under `Not grouped` with its objective, followed by `failed: grouping by goal: …`, and the run exits 1. A session it left out is shown under `Not grouped` with a warning, and the run still exits 0, since every session is on screen. A failed call fails the same way as a rejected answer.
-- **The ask is printed verbatim** under a blocked session's line, from its summary. A `waiting` session, or one with a `waiting` subagent, without one says where a prompt or question is open.
-- **Goals are ordered by their most urgent bucket, then by latest activity;** sessions within a bucket by latest activity. Opus's order isn't used.
+- **Opus input:** per root, its live state, title, directory, branch, last activity (time and age), each subagent that isn't `ended` with its state and objective, and the summary without `tried`, which doesn't bear on buckets, goals or one line.
+- **Opus's answer is checked against the input.** The schema lists the input's ids and the three buckets as enums, so the CLI's schema check sends a bad value back to Opus within the call; the code check is the backstop. An id it wasn't given, an id listed twice, or a bucket outside the three rejects the whole answer: every session is shown under `Not grouped` with its objective, followed by `failed: grouping by goal: …`, and the run exits 1. A session it left out is shown under `Not grouped` with a warning, and the run still exits 0, since every session is on screen. A failed call fails the same way as a rejected answer.
+- **A `Not grouped` session has no bucket.** It's printed without a bucket heading, after the goals, and counted apart in the tally (`· 1 not grouped`). When the whole answer was rejected, the tally shows only that count, since no session was judged and `0 blocked on you` would claim otherwise.
+- **The ask is printed verbatim** under a session Opus put in blocked, or one under `Not grouped`, from its summary. A `waiting` session, or one with a `waiting` subagent, without one says where a prompt or question is open. A failed grouping puts every session under `Not grouped`, and the open questions are what the developer still needs from that degraded run.
+- **Goals are ordered by their most urgent bucket, then by latest activity;** buckets within a goal go blocked, running, finished, and sessions within a bucket by latest activity. Opus's order isn't used.
 - **No session in the window prints one line and makes no Opus call.**
-- **Opus input:** per root, its bucket and the reason for it, live state, title, directory, branch, last activity, subagent counts with each busy subagent's objective, and the summary without `tried`, which doesn't bear on goals or one line.
 
 ## `status summaries`
 
