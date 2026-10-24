@@ -42,7 +42,9 @@ test("a stray argument or a bad --days fails closed", async () => {
 	for (const args of [
 		["--days", "3", "summaries"],
 		["--days", "0"],
+		["--days", "3651"],
 		["summaries", "--days", "two"],
+		["summaries", "--days", "99999999999999999999"],
 	]) {
 		const result = await run(args, refuseToOpen);
 
