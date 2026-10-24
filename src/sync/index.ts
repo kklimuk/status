@@ -10,7 +10,6 @@ import type {
 } from "@src/harnesses";
 import { and, eq, gte, inArray, ne, notInArray, or } from "drizzle-orm";
 
-/** @public */
 export type SyncReport = {
 	sources: number;
 	sessions: number;
@@ -19,7 +18,6 @@ export type SyncReport = {
 	failures: SyncIssue[];
 };
 
-/** @public */
 export type SyncIssue = {
 	harness: Harness;
 	step: "list" | "read" | "snapshot";

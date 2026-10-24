@@ -42,7 +42,7 @@ Each step fails on its own and the rest carry on, because one broken transcript 
 
 ## Snapshots
 
-- **"Recently active" is the adapter's sessions whose source this run listed, or whose `last_event_at` is at or after `since`, or that are still marked `busy` or `idle`.**
+- **"Recently active" is the adapter's sessions whose source this run listed, or whose `last_event_at` is at or after `since`, or that are still marked `busy`, `idle` or `waiting`.**
   - Listed sources count because `listSources` goes by file modification time: a live session whose recent lines carry no events (a title, a hook) would otherwise be stored `ended` and never looked at.
   - Still-live sessions count so a long-idle one that fell out of the window can still be seen to end.
 - **A live entry overwrites `state`, `cwd` and `branch`** and sets `observed_at` to `app.now()`.

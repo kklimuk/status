@@ -1,5 +1,3 @@
-export type CommandResult = { output: string; exitCode: number };
-
 export function usage(...synopses: string[]): string {
 	const label = colorize("usage:", "heading");
 	return synopses
@@ -29,6 +27,8 @@ export function colorize(text: string, tone: Tone): string {
 	const code = Bun.color(TONES[tone], "ansi");
 	return code ? `${code}${text}${RESET}` : text;
 }
+
+export type CommandResult = { output: string; exitCode: number };
 
 type Tone = keyof typeof TONES;
 

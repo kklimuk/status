@@ -11,13 +11,11 @@ export type HarnessAdapter = {
 	snapshot(sessions: SessionRecord[]): Promise<SessionSnapshot[]>;
 };
 
-/** @public */
 export type IngestedSource = {
 	session: SessionRecord;
 	readOffset: number;
 };
 
-/** @public */
 export type SourceRead = {
 	session: SessionRecord;
 	events: SessionEvent[];
@@ -25,7 +23,6 @@ export type SourceRead = {
 	warnings: string[];
 };
 
-/** @public */
 export type SessionRecord = {
 	id: string;
 	harness: Harness;
@@ -38,7 +35,6 @@ export type SessionRecord = {
 	sourcePath: string;
 };
 
-/** @public */
 export type SessionEvent =
 	| {
 			kind: "message";
@@ -62,7 +58,6 @@ export type SessionEvent =
 			toolStatus: Exclude<ToolStatus, "pending">;
 	  };
 
-/** @public */
 export type SessionSnapshot = {
 	sessionId: string;
 	state: Exclude<SessionState, "ended">;
@@ -74,7 +69,7 @@ export type Harness = "claude" | "codex";
 
 export type Surface = "cli" | "vscode" | "app" | "unknown";
 
-export type SessionState = "busy" | "idle" | "ended";
+export type SessionState = "busy" | "idle" | "waiting" | "ended";
 
 export type ToolStatus =
 	| "pending"

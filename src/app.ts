@@ -9,15 +9,6 @@ import { readFileSync, statSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
-export type App = {
-	database: StatusDatabase;
-	paths: { status: string; claude: string; codex: string };
-	adapters: HarnessAdapter[];
-	now(): Date;
-	progress(message: string): void;
-	askClaude(request: ClaudeRequest): Promise<ClaudeResponse>;
-};
-
 export function createApp(environment: Environment): App {
 	const paths = {
 		status: environment.STATUS_HOME || defaultStatusHome(CHECKOUT),
@@ -51,6 +42,15 @@ function progress(message: string) {
 		process.stderr.write(`${message}\n`);
 	}
 }
+
+export type App = {
+	database: StatusDatabase;
+	paths: { status: string; claude: string; codex: string };
+	adapters: HarnessAdapter[];
+	now(): Date;
+	progress(message: string): void;
+	askClaude(request: ClaudeRequest): Promise<ClaudeResponse>;
+};
 
 type Environment = Record<string, string | undefined>;
 

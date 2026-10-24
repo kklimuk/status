@@ -29,7 +29,7 @@
 
 ## `snapshot(sessions)`
 
-- **Returns the live sessions among those it's given, subagents included,** each `busy` or `idle` with its live `cwd` and `branch`. Sync marks every session the snapshot leaves out `ended`.
+- **Returns the live sessions among those it's given, subagents included,** each `busy`, `idle` or `waiting` with its live `cwd` and `branch`. `waiting` means blocked on the user: a permission prompt or a question the harness itself is holding open. Sync marks every session the snapshot leaves out `ended`.
 - **Snapshots observe the real present** (live pids, file modification times), so adapters use the real clock, not `app.now()`.
 
 ## Surface

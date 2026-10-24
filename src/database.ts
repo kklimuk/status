@@ -11,8 +11,6 @@ import { integer, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 import { mkdirSync } from "fs";
 import { dirname, join } from "path";
 
-export type StatusDatabase = ReturnType<typeof openDatabase>;
-
 export function openDatabase(path: string) {
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	const client = new Database(path, { create: true, strict: true });
@@ -79,5 +77,7 @@ export const summaries = sqliteTable("summaries", {
 		.notNull(),
 	updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });
+
+export type StatusDatabase = ReturnType<typeof openDatabase>;
 
 const MIGRATIONS_FOLDER = join(import.meta.dir, "..", "drizzle");
