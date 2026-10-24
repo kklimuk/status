@@ -13,7 +13,7 @@ Everything runs on your machine. `status` reads your local session history and a
 You need [Bun](https://bun.sh) and [Claude Code](https://claude.com/claude-code), signed in. Codex is optional: its sessions are included when it's installed.
 
 ```bash
-git clone <this repo> status
+git clone git@github.com:kklimuk/status.git
 cd status
 bun install
 bun link        # puts `status` on your PATH
