@@ -382,7 +382,7 @@ function renderSummary(summary: SummaryFields): string {
 		`next:${list(summary.next)}`,
 		`blockers:${list(summary.blockers)}`,
 		`waiting_on: ${summary.waitingOn}`,
-		`ask: ${summary.ask ?? "none"}`,
+		`ask: ${summary.ask ?? "null"}`,
 		`outcome: ${summary.outcome}`,
 	].join("\n");
 }
@@ -396,6 +396,18 @@ function parseSummary(output: unknown): SummaryFields {
 		"waiting_on",
 	);
 	const ask = optionalText(field("ask"), "ask");
+	const outcome = requireChoice(field("outcome"), OUTCOMES, "outcome");
+	if (waitingOn === "user" && ask === null) {
+		throw new Error("Haiku returned waiting_on user without an ask");
+	}
+	if (waitingOn !== "user" && ask !== null) {
+		throw new Error(`Haiku returned an ask while waiting_on is ${waitingOn}`);
+	}
+	if (outcome === "done" && waitingOn !== "none") {
+		throw new Error(
+			`Haiku returned outcome done while waiting_on is ${waitingOn}`,
+		);
+	}
 	return {
 		objective: requireText(field("objective"), "objective"),
 		progress: requireList(field("progress"), "progress"),
@@ -403,8 +415,8 @@ function parseSummary(output: unknown): SummaryFields {
 		next: requireList(field("next"), "next"),
 		blockers: requireList(field("blockers"), "blockers"),
 		waitingOn,
-		ask: waitingOn === "user" ? ask : null,
-		outcome: requireChoice(field("outcome"), OUTCOMES, "outcome"),
+		ask,
+		outcome,
 	};
 }
 
@@ -598,11 +610,11 @@ Write plain text, one sentence per list item. Use exact names, never vague ones.
 - objective: the user's goal in one or two sentences, from the first user message and any later change of direction. Only the goal: no status, no working directory.
 - progress: what is done, most important first: changes made and the files they touched, checks that passed with their command, commits with hash and message, PRs, decisions taken. Only what was actually done, not what was planned. If the last tool calls are still pending, say what was started and that it has no result yet. At most 8 items.
 - tried: approaches that failed or were dropped, each with why: the error, the failing command, the reason the user rejected it, what a subagent looked for and didn't find, a user_denied call with the user's reason when given, an auto_denied call the session worked around. Not open problems (those are blockers), not problems since solved (those are progress, with the fix), and not trivia that teaches nothing, such as a typo fixed on the next try or a network error a retry got past. At most 8 items. Empty if nothing failed.
-- next: the remaining steps toward the objective that the session itself stated or committed to. Never add steps of your own, such as a review, an extra check or a wider test run, and drop steps the new entries show done or dropped. A follow-up the session offered after meeting the objective goes here as "Offered: ...". Empty when nothing remains.
+- next: the remaining steps toward the objective that the session itself stated or committed to. Never add steps of your own, such as a review, an extra check or a wider test run, and drop steps the new entries show done or dropped. An offer or proposal still waiting on the user's answer is the ask, not a step. Empty when nothing remains.
 - blockers: what stops progress right now: an unanswered question, an auto_denied call the session stalled on (it may need the user's manual approval or another approach), an error the session couldn't get past, something external. A dead end the session routed around belongs in tried, not here. Empty if nothing.
-- waiting_on: user when the session can't continue without the user (an unanswered question or choice, an approval, a permission, something only the user can do); external when it waits on something outside the session (CI, a review, a deploy, another team); none when it is working, or finished.
-- ask: when waiting_on is user, the exact question or decision, self-contained: what is being decided, the options the session offered and its recommendation, and the context needed to answer without the transcript. Never ask the user to approve a call they already denied. Otherwise null.
-- outcome: done when the session's latest report says the objective is met (the change made and checked, committed, the question answered), even if it offers extras such as pushing, opening a PR or further fixes: an optional offer is not an ask, and doesn't keep the session in progress. abandoned when the user or the session gave up or moved on without finishing. in_progress otherwise, including while waiting on the user.`;
+- waiting_on: user when the session stopped for the user: an unanswered question or choice, an offer or proposal of more work, an approval, a permission, something only the user can do; external when it waits on something outside the session (CI, a review, a deploy, another team); none when it is still working, done or abandoned.
+- ask: when waiting_on is user, the exact question or decision, self-contained: what is being decided, the options the session offered and its recommendation, and the context needed to answer without the transcript. When the session ended by offering or proposing more work, the ask is that offer as a question the user can answer yes or no, such as "Push the branch and open a PR?". Never ask the user to approve a call they already denied. Otherwise null.
+- outcome: done only when nothing is left: the session's latest report says the work is finished and it proposes nothing further. A session that ends offering or proposing more work, such as pushing, opening a PR or a further fix, is not done: it is in_progress and waiting on the user, with the offer as the ask. abandoned when the user or the session gave up or moved on without finishing. in_progress otherwise, including while waiting on the user or on something external.`;
 
 const SUMMARY_SCHEMA = {
 	type: "object",
@@ -627,4 +639,17 @@ const SUMMARY_SCHEMA = {
 		"outcome",
 	],
 	additionalProperties: false,
+	allOf: [
+		{
+			if: { properties: { waiting_on: { const: "user" } } },
+			// biome-ignore lint/suspicious/noThenProperty: a JSON Schema keyword, never awaited
+			then: { properties: { ask: { type: "string", pattern: "\\S" } } },
+			else: { properties: { ask: { type: "null" } } },
+		},
+		{
+			if: { properties: { outcome: { const: "done" } } },
+			// biome-ignore lint/suspicious/noThenProperty: a JSON Schema keyword, never awaited
+			then: { properties: { waiting_on: { const: "none" } } },
+		},
+	],
 };

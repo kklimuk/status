@@ -4,12 +4,12 @@ import { chmodSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
-test("askClaude sends the input on stdin with MCP servers and tools off, and counts cached input", async () => {
+test("askClaude sends the input on stdin with MCP servers and tools off, nests the schema under one property, and counts cached input", async () => {
 	const claude = await createFakeClaude({
 		stdout: JSON.stringify({
 			is_error: false,
 			subtype: "success",
-			structured_output: { done: true },
+			structured_output: { output: { done: true } },
 			usage: {
 				input_tokens: 2,
 				cache_read_input_tokens: 100,
@@ -36,13 +36,19 @@ test("askClaude sends the input on stdin with MCP servers and tools off, and cou
 	expect(flag(args, "--setting-sources")).toEqual(["--setting-sources", ""]);
 	expect(flag(args, "--tools")).toEqual(["--tools", ""]);
 	expect(flag(args, "--effort")).toEqual(["--effort", "medium"]);
+	expect(JSON.parse(flag(args, "--json-schema")[1] ?? "")).toEqual({
+		type: "object",
+		properties: { output: REQUEST.schema },
+		required: ["output"],
+		additionalProperties: false,
+	});
 });
 
 test("a call the CLI retried bills every request but reports its largest prompt on its own", async () => {
 	const claude = await createFakeClaude({
 		stdout: JSON.stringify({
 			is_error: false,
-			structured_output: { done: true },
+			structured_output: { output: { done: true } },
 			usage: {
 				input_tokens: 4,
 				cache_read_input_tokens: 6484,

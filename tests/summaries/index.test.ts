@@ -401,24 +401,51 @@ test("an answer that doesn't match the summary schema fails closed", async () =>
 	expect(storedSummary(app, "claude:root")).toBeUndefined();
 });
 
-test("an ask is kept only while the session waits on the user", async () => {
-	const claude = fakeClaude((request) =>
-		request.input.includes("claude:waiting")
-			? { ...SUMMARY, waiting_on: "user", ask: "Push to main or open a PR?" }
-			: { ...SUMMARY, waiting_on: "none", ask: "Want me to open a PR?" },
-	);
+test("an ask comes exactly with waiting on the user, and a done session waits on no one, or the summary fails closed", async () => {
+	const answers: Record<string, Record<string, unknown>> = {
+		"claude:offered": { waiting_on: "user", ask: "Push and open a PR?" },
+		"claude:unlabeled": { waiting_on: "none", ask: "Push and open a PR?" },
+		"claude:unasked": { waiting_on: "user", ask: null },
+		"claude:contradicted": {
+			waiting_on: "user",
+			ask: "Push and open a PR?",
+			outcome: "done",
+		},
+	};
+	const claude = fakeClaude((request) => {
+		const id = Object.keys(answers).find((key) => request.input.includes(key));
+		return { ...SUMMARY, ...answers[id ?? ""] };
+	});
 	const app = createTestApp({ askClaude: claude.askClaude, now: () => NOW });
-	for (const id of ["claude:waiting", "claude:done"]) {
+	for (const id of Object.keys(answers)) {
 		addSession(app, id);
 		addEvents(app, id, [message("user", `Work on ${id}`, 0)]);
 	}
 
-	await refreshSummaries(app);
+	const report = await refreshSummaries(app);
 
-	expect(storedSummary(app, "claude:waiting")?.ask).toBe(
-		"Push to main or open a PR?",
-	);
-	expect(storedSummary(app, "claude:done")?.ask).toBeNull();
+	expect(storedSummary(app, "claude:offered")).toMatchObject({
+		waitingOn: "user",
+		ask: "Push and open a PR?",
+	});
+	expect(
+		report.failures.toSorted((left, right) =>
+			left.sessionId.localeCompare(right.sessionId),
+		),
+	).toEqual([
+		{
+			sessionId: "claude:contradicted",
+			message: "Haiku returned outcome done while waiting_on is user",
+		},
+		{
+			sessionId: "claude:unasked",
+			message: "Haiku returned waiting_on user without an ask",
+		},
+		{
+			sessionId: "claude:unlabeled",
+			message: "Haiku returned an ask while waiting_on is none",
+		},
+	]);
 });
 
 test("a prompt over 100,000 tokens is reported, but a retried call whose prompts each stayed under is not", async () => {

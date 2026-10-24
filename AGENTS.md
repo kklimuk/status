@@ -49,11 +49,16 @@
 
 ## Calling Claude
 
-- **`askClaude` runs `claude -p` with the input on stdin** and returns `.structured_output` plus two token counts, each `input_tokens`, cache reads and cache writes added together. On a cached prompt, `input_tokens` alone is a handful.
+- **`askClaude` runs `claude -p` with the input on stdin** and returns `.structured_output.output` (see the nesting below) plus two token counts, each `input_tokens`, cache reads and cache writes added together. On a cached prompt, `input_tokens` alone is a handful.
   - **`inputTokens` is what the call billed:** the CLI's top-level `usage`, which sums every API request the call made.
   - **`largestPromptTokens` is the largest single prompt it sent:** the last entry of `usage.iterations`. That entry is the call's last request, and it carries every earlier turn, so it's the largest. When `iterations` is absent, it falls back to `inputTokens`.
   - **The two differ when the CLI retries.** A `StructuredOutput` answer that fails the `--json-schema` check goes back to the model as a tool error, and the CLI sends the whole prompt again, so `usage` counts it twice. One summary call saw requests of 3,244 and 4,615 tokens and a `usage` of 7,859.
   - **Haiku's 100,000-token price tier applies per request,** so compare `largestPromptTokens` against it, not `inputTokens`.
+- **`askClaude` nests the caller's schema under one `output` property,** and returns that property. `--json-schema` turns the schema's top-level properties into the `StructuredOutput` tool's parameters. In the tool-call format a string parameter is raw text and any other parameter is JSON, and Haiku mixed the two up:
+  - it wrote an enum string as JSON after four array fields: `waiting_on` came back as `"\"user\""` or `"[\"user\"]"`;
+  - it closed a string with `</objective>`, which swallowed the next parameter into it.
+
+  The CLI's schema check failed those answers and re-sent the prompt: 10 of 29 summary calls on 2026-10-23. Nested, the whole answer is one JSON value, where quoting is right and there's no tag to slip on: 0 of 28 retried on the same inputs.
 - **`--strict-mcp-config` is essential.** Without it, every call loads every configured MCP server's tool definitions: about 115k tokens of overhead on a one-sentence input, against about 1.1k with it.
 - **`--setting-sources ""` keeps the caller's project out of the call.** Without it, `claude -p` loads the `CLAUDE.md` and `AGENTS.md` of the directory `status` runs from and every parent, plus settings hooks and plugins. From inside this repo that added about 4.5k tokens to a one-line call, and the project's rules would steer the summaries. A hook that runs `status` could even recurse. The OAuth login still works with it.
 - **Never pass `--bare`.** It skips the OAuth login and fails with "Not logged in".

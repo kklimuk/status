@@ -41,12 +41,13 @@ export async function askClaude(
 		const reason = result.result ?? result.subtype ?? "no reason given";
 		throw new Error(`claude -p failed: ${reason}`);
 	}
-	if (result.structured_output === undefined) {
+	const output = result.structured_output?.output;
+	if (output === undefined) {
 		throw new Error("claude -p returned no structured output");
 	}
 	const usage = result.usage ?? {};
 	return {
-		output: result.structured_output,
+		output,
 		inputTokens: countInputTokens(usage),
 		largestPromptTokens: countInputTokens(usage.iterations?.at(-1) ?? usage),
 	};
@@ -70,7 +71,12 @@ function claudeArguments(request: ClaudeRequest): string[] {
 		"--output-format",
 		"json",
 		"--json-schema",
-		JSON.stringify(request.schema),
+		JSON.stringify({
+			type: "object",
+			properties: { output: request.schema },
+			required: ["output"],
+			additionalProperties: false,
+		}),
 	];
 }
 
@@ -94,7 +100,7 @@ type ClaudeResult = {
 	is_error?: boolean;
 	subtype?: string;
 	result?: string;
-	structured_output?: unknown;
+	structured_output?: { output?: unknown };
 	usage?: TokenUsage & { iterations?: TokenUsage[] };
 };
 
