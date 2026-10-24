@@ -96,14 +96,17 @@ test("an error result fails closed even when the CLI exits zero", async () => {
 	);
 });
 
-test("a result without structured output fails closed", async () => {
-	const claude = await createFakeClaude({
-		stdout: JSON.stringify({ is_error: false, result: "plain text" }),
-	});
+test("a result without structured output, or with it outside the output property, fails closed", async () => {
+	for (const result of [
+		{ is_error: false, result: "plain text" },
+		{ is_error: false, structured_output: { done: true } },
+	]) {
+		const claude = await createFakeClaude({ stdout: JSON.stringify(result) });
 
-	await expect(askClaude(REQUEST, claude.executable)).rejects.toThrow(
-		"no structured output",
-	);
+		await expect(askClaude(REQUEST, claude.executable)).rejects.toThrow(
+			"no structured output",
+		);
+	}
 });
 
 async function createFakeClaude({

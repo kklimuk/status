@@ -5,38 +5,32 @@ import {
 	sessions,
 	summaries,
 } from "@src/database";
-import { and, asc, desc, eq, gt, lt, max, sql } from "drizzle-orm";
+import { and, asc, eq, gt, lte, max, sql } from "drizzle-orm";
 
-/** @public */
-export type SummaryReport = {
-	refreshed: number;
-	deferred: string[];
-	calls: number;
-	inputTokens: number;
-	warnings: SummaryIssue[];
-	failures: SummaryIssue[];
-};
-
-/** @public */
-export type SummaryIssue = { sessionId: string; message: string };
-
-/** @public */
 export async function refreshSummaries(app: App): Promise<SummaryReport> {
 	const plan = app.database.transaction((transaction) =>
 		planRefresh(transaction, app.now()),
 	);
+	const total = plan.levels.flat().length;
 	let started = 0;
-	const outcomes = await mapWithLimit(plan.due, CONCURRENT_CALLS, (work) => {
-		started += 1;
-		app.progress(`summarizing ${started}/${plan.due.length}`);
-		return refresh(app, work);
-	});
+	const outcomes: Outcome[] = [];
+	for (const level of plan.levels) {
+		const finished = await mapWithLimit(level, CONCURRENT_CALLS, (due) => {
+			started += 1;
+			app.progress(`summarizing ${started}/${total}`);
+			return refresh(app, due);
+		});
+		outcomes.push(...finished);
+	}
 	const calls = outcomes.flatMap((outcome) => outcome.calls);
 	return {
-		refreshed: outcomes.filter((outcome) => outcome.failure === null).length,
+		roots: tally(
+			outcomes.filter((outcome) => outcome.session.parentId === null),
+		),
+		subagents: tally(
+			outcomes.filter((outcome) => outcome.session.parentId !== null),
+		),
 		deferred: plan.deferred,
-		calls: calls.length,
-		inputTokens: calls.reduce((sum, call) => sum + call.inputTokens, 0),
 		warnings: calls
 			.filter((call) => call.largestPromptTokens > PRICE_THRESHOLD_TOKENS)
 			.map((call) => ({
@@ -47,51 +41,10 @@ export async function refreshSummaries(app: App): Promise<SummaryReport> {
 	};
 }
 
-async function refresh(app: App, work: Work): Promise<Outcome> {
-	const calls: Call[] = [];
-	try {
-		if (work.entries.length === 0) {
-			advanceSummary(app, work);
-		} else {
-			storeSummary(app, work, await summarize(app, work, calls));
-		}
-		return { calls, failure: null };
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		return { calls, failure: { sessionId: work.root.id, message } };
-	}
-}
-
-function planRefresh(
-	database: Reader,
-	now: Date,
-): { due: Work[]; deferred: string[] } {
-	const rows = database
-		.select({
-			id: sessions.id,
-			parentId: sessions.parentId,
-			title: sessions.title,
-			cwd: sessions.cwd,
-			state: sessions.state,
-			lastEventAt: sessions.lastEventAt,
-		})
-		.from(sessions)
-		.all();
-	const newestEventIds = new Map(
-		database
-			.select({ sessionId: events.sessionId, newest: max(events.id) })
-			.from(events)
-			.groupBy(events.sessionId)
-			.all()
-			.map((row) => [row.sessionId, row.newest ?? 0]),
-	);
-	const stored = new Map(
-		database
-			.select()
-			.from(summaries)
-			.all()
-			.map((row) => [row.sessionId, row]),
-	);
+function planRefresh(database: Reader, now: Date): Plan {
+	const rows = sessionRows(database);
+	const newestEventIds = newestEventIdBySession(database);
+	const stored = summariesBySession(database);
 	const childrenByParent = Map.groupBy(
 		rows.filter((row) => row.parentId !== null),
 		(row) => row.parentId,
@@ -100,100 +53,130 @@ function planRefresh(
 		.filter((row) => row.parentId === null)
 		.sort((left, right) => +right.lastEventAt - +left.lastEventAt);
 
-	const due: Work[] = [];
+	const due: Due[] = [];
 	const deferred: string[] = [];
 	for (const root of roots) {
-		const subagents = descendantsOf(root.id, childrenByParent);
-		const throughEventId = Math.max(
-			...[root, ...subagents].map((row) => newestEventIds.get(row.id) ?? 0),
+		const stale = familyOf(root, childrenByParent, newestEventIds).filter(
+			(member) =>
+				member.throughEventId >
+				(stored.get(member.session.id)?.throughEventId ?? 0),
 		);
-		const previous = stored.get(root.id) ?? null;
-		const after = previous?.throughEventId ?? 0;
-		if (throughEventId <= after) {
+		if (stale.length === 0) {
 			continue;
 		}
-		if (previous && root.state === "busy" && isRecent(previous, now)) {
+		const rootSummary = stored.get(root.id);
+		if (rootSummary && root.state === "busy" && isRecent(rootSummary, now)) {
 			deferred.push(root.id);
 			continue;
 		}
-		const changedSubagents = subagents.filter(
-			(subagent) => (newestEventIds.get(subagent.id) ?? 0) > after,
-		);
-		const work = loadWork(
-			database,
-			root,
-			changedSubagents,
-			previous,
-			throughEventId,
-		);
-		if (work.entries.length > 0 || previous) {
-			due.push(work);
+		for (const member of stale) {
+			const previous = stored.get(member.session.id) ?? null;
+			const after = previous?.throughEventId ?? 0;
+			due.push({
+				...member,
+				previous,
+				after,
+				changedChildren: member.children.filter(
+					(child) => child.throughEventId > after,
+				),
+			});
 		}
 	}
-	return { due, deferred };
+	const levels = [...Map.groupBy(due, (item) => item.depth)]
+		.sort(([left], [right]) => right - left)
+		.map(([, items]) => items);
+	return { levels, deferred };
 }
 
-function descendantsOf(
-	rootId: string,
+function familyOf(
+	root: SessionRow,
 	childrenByParent: Map<string | null, SessionRow[]>,
-): SessionRow[] {
-	const found: SessionRow[] = [];
-	const seen = new Set([rootId]);
-	const queue = [rootId];
-	for (const parentId of queue) {
-		for (const child of childrenByParent.get(parentId) ?? []) {
-			if (!seen.has(child.id)) {
-				seen.add(child.id);
-				found.push(child);
-				queue.push(child.id);
-			}
-		}
+	newestEventIds: Map<string, number>,
+): Member[] {
+	const members: Member[] = [];
+	function visit(session: SessionRow, depth: number): Member {
+		const children = (childrenByParent.get(session.id) ?? []).map((child) =>
+			visit(child, depth + 1),
+		);
+		const member = {
+			session,
+			depth,
+			children,
+			throughEventId: Math.max(
+				newestEventIds.get(session.id) ?? 0,
+				...children.map((child) => child.throughEventId),
+			),
+			lastActiveAt: new Date(
+				Math.max(
+					+session.lastEventAt,
+					...children.map((child) => +child.lastActiveAt),
+				),
+			),
+		};
+		members.push(member);
+		return member;
 	}
-	return found;
+	visit(root, 0);
+	return members;
 }
 
 function isRecent(summary: StoredSummary, now: Date): boolean {
 	return +now - +summary.updatedAt < BUSY_REFRESH_MS;
 }
 
-function loadWork(
-	database: Reader,
-	root: SessionRow,
-	subagents: SessionRow[],
-	previous: StoredSummary | null,
-	throughEventId: number,
-): Work {
-	const after = previous?.throughEventId ?? 0;
-	const rootEntries = database
-		.select()
-		.from(events)
-		.where(and(eq(events.sessionId, root.id), gt(events.id, after)))
-		.orderBy(asc(events.at), asc(events.id))
-		.all()
-		.map(renderEvent);
-	const subagentEntries = subagents.flatMap((subagent) =>
-		renderSubagent(database, subagent, after),
+async function mapWithLimit<Item, Result>(
+	items: Item[],
+	limit: number,
+	work: (item: Item) => Promise<Result>,
+): Promise<Result[]> {
+	const results: Result[] = [];
+	const queue = items.entries();
+	async function worker() {
+		for (const [index, item] of queue) {
+			results[index] = await work(item);
+		}
+	}
+	await Promise.all(Array.from({ length: limit }, worker));
+	return results;
+}
+
+async function refresh(app: App, due: Due): Promise<Outcome> {
+	const calls: Call[] = [];
+	try {
+		const work = loadWork(app.database, due);
+		storeSummary(app, due, await summarize(app, work, calls));
+		return { session: due.session, calls, failure: null };
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return {
+			session: due.session,
+			calls,
+			failure: { sessionId: due.session.id, message },
+		};
+	}
+}
+
+function loadWork(database: Reader, due: Due): Work {
+	const own = eventsBetween(
+		database,
+		due.session.id,
+		due.after,
+		due.throughEventId,
+	).map(renderEvent);
+	const subagents = due.changedChildren.map((child) =>
+		renderSubagent(database, child),
 	);
-	const entries = [...rootEntries, ...subagentEntries].sort(
-		(left, right) => +left.at - +right.at || left.id - right.id,
-	);
-	const firstUserMessage = database
-		.select({ text: events.text })
-		.from(events)
-		.where(and(eq(events.sessionId, root.id), eq(events.role, "user")))
-		.orderBy(asc(events.at), asc(events.id))
-		.limit(1)
-		.get();
 	return {
-		root,
-		previous: previous ? fieldsFromRow(previous) : null,
-		firstUserMessage: firstUserMessage?.text ?? null,
-		entries,
-		throughEventId,
+		session: due.session,
+		previous: due.previous ? fieldsFromRow(due.previous) : null,
+		firstUserMessage: firstUserMessage(database, due.session.id),
+		entries: [...own, ...subagents].sort(
+			(left, right) => +left.at - +right.at || left.id - right.id,
+		),
 	};
 }
 
-function renderEvent(row: typeof events.$inferSelect): Entry {
+function renderEvent(row: EventRow): Entry {
 	const time = formatTime(row.at);
 	if (row.role === "tool") {
 		const status = row.toolStatus ?? "pending";
@@ -210,7 +193,11 @@ function renderEvent(row: typeof events.$inferSelect): Entry {
 	};
 }
 
-function toolHeadline(row: typeof events.$inferSelect): string {
+function formatTime(at: Date): string {
+	return at.toISOString().slice(0, 16).replace("T", " ");
+}
+
+function toolHeadline(row: EventRow): string {
 	const target = row.toolTarget?.replaceAll("\n", ", ");
 	const headline = target ? `${row.toolName ?? ""} ${target}` : row.text;
 	const line = headline.replace(/\s+/g, " ").trim();
@@ -220,74 +207,6 @@ function toolHeadline(row: typeof events.$inferSelect): string {
 	return `${line.slice(0, MAX_TOOL_CHARS)}…`;
 }
 
-function renderSubagent(
-	database: Reader,
-	subagent: SessionRow,
-	after: number,
-): Entry[] {
-	const entries: Entry[] = [];
-	const task = taskOf(database, subagent.id);
-	if (task && task.id > after) {
-		entries.push({
-			id: task.id,
-			at: task.at,
-			text: `[${formatTime(task.at)} subagent ${subagent.id} started] ${describeTask(task.text)}`,
-		});
-	}
-	const report = latestEvent(database, subagent.id, "assistant");
-	if (report && report.id > after) {
-		const finished = latestEvent(database, subagent.id)?.id === report.id;
-		const status = finished ? "finished" : "unfinished, latest message";
-		entries.push({
-			id: report.id,
-			at: report.at,
-			text: `[${formatTime(report.at)} subagent ${subagent.id} ${status}]\n${cutMiddle(report.text)}`,
-		});
-	}
-	return entries;
-}
-
-function taskOf(database: Reader, sessionId: string) {
-	const opening = database
-		.select({
-			id: events.id,
-			at: events.at,
-			role: events.role,
-			text: events.text,
-		})
-		.from(events)
-		.where(eq(events.sessionId, sessionId))
-		.orderBy(asc(events.at), asc(events.id))
-		.limit(OPENING_EVENTS)
-		.all();
-	const firstReply = opening.findIndex((row) => row.role !== "user");
-	const prompts = firstReply === -1 ? opening : opening.slice(0, firstReply);
-	return prompts.at(-1);
-}
-
-function describeTask(text: string): string {
-	const readable = text.replace(ENCRYPTED_PAYLOAD, "").trim();
-	if (readable === text.trim()) {
-		return `task:\n${cutMiddle(text)}`;
-	}
-	return `task, encrypted apart from its header:\n${readable}`;
-}
-
-function latestEvent(database: Reader, sessionId: string, role?: "assistant") {
-	const ofRole = role ? eq(events.role, role) : undefined;
-	return database
-		.select({ id: events.id, at: events.at, text: events.text })
-		.from(events)
-		.where(and(eq(events.sessionId, sessionId), ofRole))
-		.orderBy(desc(events.at), desc(events.id))
-		.limit(1)
-		.get();
-}
-
-function formatTime(at: Date): string {
-	return at.toISOString().slice(0, 16).replace("T", " ");
-}
-
 function cutMiddle(text: string): string {
 	if (text.length <= MAX_MESSAGE_CHARS) {
 		return text;
@@ -295,6 +214,50 @@ function cutMiddle(text: string): string {
 	const half = MAX_MESSAGE_CHARS / 2;
 	const omitted = text.length - MAX_MESSAGE_CHARS;
 	return `${text.slice(0, half)}\n[… ${omitted} characters cut …]\n${text.slice(-half)}`;
+}
+
+function renderSubagent(database: Reader, child: Member): Entry {
+	const summary = summaryOf(database, child.session.id);
+	if (!summary || summary.throughEventId < child.throughEventId) {
+		throw new Error(
+			`waits for subagent ${child.session.id}, whose summary is behind`,
+		);
+	}
+	const at = child.lastActiveAt;
+	return {
+		id: child.throughEventId,
+		at,
+		text: `[${formatTime(at)} subagent ${child.session.id}'s summary]\n${renderSummary(fieldsFromRow(summary))}`,
+	};
+}
+
+function renderSummary(summary: SummaryFields): string {
+	const list = (items: string[]) =>
+		items.length > 0 ? items.map((item) => `\n- ${item}`).join("") : " none";
+	return [
+		`objective: ${summary.objective}`,
+		`progress:${list(summary.progress)}`,
+		`tried:${list(summary.tried)}`,
+		`next:${list(summary.next)}`,
+		`blockers:${list(summary.blockers)}`,
+		`waiting_on: ${summary.waitingOn}`,
+		`ask: ${summary.ask ?? "null"}`,
+		`outcome: ${summary.outcome}`,
+	].join("\n");
+}
+
+function fieldsFromRow(row: StoredSummary): SummaryFields {
+	const list = (text: string) => text.split("\n").filter((item) => item !== "");
+	return {
+		objective: row.objective,
+		progress: list(row.progress),
+		tried: list(row.tried),
+		next: list(row.next),
+		blockers: list(row.blockers),
+		waitingOn: row.waitingOn,
+		ask: row.ask,
+		outcome: row.outcome,
+	};
 }
 
 async function summarize(
@@ -313,7 +276,7 @@ async function summarize(
 			schema: SUMMARY_SCHEMA,
 		});
 		calls.push({
-			sessionId: work.root.id,
+			sessionId: work.session.id,
 			chunk: index + 1,
 			chunks: chunks.length,
 			estimatedTokens: estimateTokens(SYSTEM_PROMPT) + estimateTokens(input),
@@ -357,7 +320,10 @@ function renderInput(
 	summary: SummaryFields | null,
 	chunk: Entry[],
 ): string {
-	const header = `Session: ${work.root.title ?? "untitled"}\nWorking directory: ${work.root.cwd}`;
+	let header = `Session: ${work.session.title ?? "untitled"}\nWorking directory: ${work.session.cwd}`;
+	if (work.session.parentId) {
+		header += `\nSubagent of: ${work.session.parentId}`;
+	}
 	const entries = chunk.map((entry) => entry.text).join("\n\n");
 	if (!summary) {
 		return `${header}\n\n## Entries\n\n${entries}`;
@@ -370,21 +336,6 @@ function renderInput(
 	}
 	sections.push(`## New entries\n\n${entries}`);
 	return sections.join("\n\n");
-}
-
-function renderSummary(summary: SummaryFields): string {
-	const list = (items: string[]) =>
-		items.length > 0 ? items.map((item) => `\n- ${item}`).join("") : " none";
-	return [
-		`objective: ${summary.objective}`,
-		`progress:${list(summary.progress)}`,
-		`tried:${list(summary.tried)}`,
-		`next:${list(summary.next)}`,
-		`blockers:${list(summary.blockers)}`,
-		`waiting_on: ${summary.waitingOn}`,
-		`ask: ${summary.ask ?? "null"}`,
-		`outcome: ${summary.outcome}`,
-	].join("\n");
 }
 
 function parseSummary(output: unknown): SummaryFields {
@@ -420,6 +371,19 @@ function parseSummary(output: unknown): SummaryFields {
 	};
 }
 
+function requireChoice<Choice extends string>(
+	value: unknown,
+	choices: readonly Choice[],
+	name: string,
+): Choice {
+	if (!choices.includes(value as Choice)) {
+		throw new Error(
+			`Haiku returned ${JSON.stringify(value)} for ${name}, not one of ${choices.join(", ")}`,
+		);
+	}
+	return value as Choice;
+}
+
 function optionalText(value: unknown, name: string): string | null {
 	if (value === null || (typeof value === "string" && value.trim() === "")) {
 		return null;
@@ -443,36 +407,10 @@ function requireList(value: unknown, name: string): string[] {
 		.filter((item) => item !== "");
 }
 
-function requireChoice<Choice extends string>(
-	value: unknown,
-	choices: readonly Choice[],
-	name: string,
-): Choice {
-	if (!choices.includes(value as Choice)) {
-		throw new Error(
-			`Haiku returned ${JSON.stringify(value)} for ${name}, not one of ${choices.join(", ")}`,
-		);
-	}
-	return value as Choice;
-}
-
-function advanceSummary(app: App, work: Work) {
-	app.database
-		.update(summaries)
-		.set({ throughEventId: work.throughEventId })
-		.where(
-			and(
-				eq(summaries.sessionId, work.root.id),
-				lt(summaries.throughEventId, work.throughEventId),
-			),
-		)
-		.run();
-}
-
-function storeSummary(app: App, work: Work, fields: SummaryFields) {
+function storeSummary(app: App, due: Due, fields: SummaryFields) {
 	const row = {
-		sessionId: work.root.id,
-		throughEventId: work.throughEventId,
+		sessionId: due.session.id,
+		throughEventId: due.throughEventId,
 		objective: fields.objective,
 		progress: fields.progress.join("\n"),
 		tried: fields.tried.join("\n"),
@@ -494,37 +432,122 @@ function storeSummary(app: App, work: Work, fields: SummaryFields) {
 		.run();
 }
 
-function fieldsFromRow(row: StoredSummary): SummaryFields {
-	const list = (text: string) => text.split("\n").filter((item) => item !== "");
+function tally(outcomes: Outcome[]): SummaryTally {
+	const calls = outcomes.flatMap((outcome) => outcome.calls);
 	return {
-		objective: row.objective,
-		progress: list(row.progress),
-		tried: list(row.tried),
-		next: list(row.next),
-		blockers: list(row.blockers),
-		waitingOn: row.waitingOn,
-		ask: row.ask,
-		outcome: row.outcome,
+		refreshed: outcomes.filter((outcome) => outcome.failure === null).length,
+		calls: calls.length,
+		inputTokens: calls.reduce((sum, call) => sum + call.inputTokens, 0),
 	};
 }
 
-async function mapWithLimit<Item, Result>(
-	items: Item[],
-	limit: number,
-	work: (item: Item) => Promise<Result>,
-): Promise<Result[]> {
-	const results: Result[] = [];
-	const queue = items.entries();
-	async function worker() {
-		for (const [index, item] of queue) {
-			results[index] = await work(item);
-		}
-	}
-	await Promise.all(Array.from({ length: limit }, worker));
-	return results;
+function sessionRows(database: Reader): SessionRow[] {
+	return database
+		.select({
+			id: sessions.id,
+			parentId: sessions.parentId,
+			title: sessions.title,
+			cwd: sessions.cwd,
+			state: sessions.state,
+			lastEventAt: sessions.lastEventAt,
+		})
+		.from(sessions)
+		.all();
 }
 
-type Outcome = { calls: Call[]; failure: SummaryIssue | null };
+function newestEventIdBySession(database: Reader): Map<string, number> {
+	const rows = database
+		.select({ sessionId: events.sessionId, newest: max(events.id) })
+		.from(events)
+		.groupBy(events.sessionId)
+		.all();
+	return new Map(rows.map((row) => [row.sessionId, row.newest ?? 0]));
+}
+
+function summariesBySession(database: Reader): Map<string, StoredSummary> {
+	const rows = database.select().from(summaries).all();
+	return new Map(rows.map((row) => [row.sessionId, row]));
+}
+
+function eventsBetween(
+	database: Reader,
+	sessionId: string,
+	afterId: number,
+	throughId: number,
+): EventRow[] {
+	return database
+		.select()
+		.from(events)
+		.where(
+			and(
+				eq(events.sessionId, sessionId),
+				gt(events.id, afterId),
+				lte(events.id, throughId),
+			),
+		)
+		.orderBy(asc(events.at), asc(events.id))
+		.all();
+}
+
+function summaryOf(
+	database: Reader,
+	sessionId: string,
+): StoredSummary | undefined {
+	return database
+		.select()
+		.from(summaries)
+		.where(eq(summaries.sessionId, sessionId))
+		.get();
+}
+
+function firstUserMessage(database: Reader, sessionId: string): string | null {
+	const row = database
+		.select({ text: events.text })
+		.from(events)
+		.where(and(eq(events.sessionId, sessionId), eq(events.role, "user")))
+		.orderBy(asc(events.at), asc(events.id))
+		.limit(1)
+		.get();
+	return row?.text ?? null;
+}
+
+export type SummaryReport = {
+	roots: SummaryTally;
+	subagents: SummaryTally;
+	deferred: string[];
+	warnings: SummaryIssue[];
+	failures: SummaryIssue[];
+};
+
+export type SummaryTally = {
+	refreshed: number;
+	calls: number;
+	inputTokens: number;
+};
+
+export type SummaryIssue = { sessionId: string; message: string };
+
+type Plan = { levels: Due[][]; deferred: string[] };
+
+type Member = {
+	session: SessionRow;
+	depth: number;
+	throughEventId: number;
+	lastActiveAt: Date;
+	children: Member[];
+};
+
+type Due = Member & {
+	previous: StoredSummary | null;
+	after: number;
+	changedChildren: Member[];
+};
+
+type Outcome = {
+	session: SessionRow;
+	calls: Call[];
+	failure: SummaryIssue | null;
+};
 
 type Call = {
 	sessionId: string;
@@ -535,25 +558,11 @@ type Call = {
 	largestPromptTokens: number;
 };
 
-type Reader = Pick<StatusDatabase, "select">;
-
-type SessionRow = {
-	id: string;
-	parentId: string | null;
-	title: string | null;
-	cwd: string;
-	state: (typeof sessions.$inferSelect)["state"];
-	lastEventAt: Date;
-};
-
-type StoredSummary = typeof summaries.$inferSelect;
-
 type Work = {
-	root: SessionRow;
+	session: SessionRow;
 	previous: SummaryFields | null;
 	firstUserMessage: string | null;
 	entries: Entry[];
-	throughEventId: number;
 };
 
 type Entry = { id: number; at: Date; text: string };
@@ -568,6 +577,21 @@ type SummaryFields = {
 	ask: string | null;
 	outcome: StoredSummary["outcome"];
 };
+
+type Reader = Pick<StatusDatabase, "select">;
+
+type SessionRow = {
+	id: string;
+	parentId: string | null;
+	title: string | null;
+	cwd: string;
+	state: (typeof sessions.$inferSelect)["state"];
+	lastEventAt: Date;
+};
+
+type EventRow = typeof events.$inferSelect;
+
+type StoredSummary = typeof summaries.$inferSelect;
 
 const MODEL = "claude-haiku-5-5";
 
@@ -587,11 +611,6 @@ const MAX_MESSAGE_CHARS = 16_000;
 
 const MAX_TOOL_CHARS = 300;
 
-const OPENING_EVENTS = 8;
-
-// fact: a Codex subagent's task arrives encrypted, and the Codex adapter keeps only its plaintext header, ending in this marker.
-const ENCRYPTED_PAYLOAD = /(?:\n\s*Payload:)?\s*\[encrypted payload\]\s*$/;
-
 const WAITING_ON = ["user", "external", "none"] as const;
 
 const OUTCOMES = ["in_progress", "done", "abandoned"] as const;
@@ -601,8 +620,9 @@ const SYSTEM_PROMPT = `You keep a rolling summary of one AI coding-agent session
 - The user reads it in a morning triage across many sessions, to see what finished, what is still running and what is waiting on them.
 
 Input
+- A header names the session and its working directory. A "Subagent of" line means this session is itself a subagent (see Subagent sessions below).
 - Entries in time order. User and assistant messages are in full; very long ones are cut in the middle. Tool calls are one-line headlines with the tool's name, its target (file, command, URL or pattern) and its outcome: ok; error; user_denied (a person rejected the call, so the user has already said no); auto_denied (an automatic reviewer refused it and no human decided); or pending (no result recorded yet). Tool output is not included, so infer results from what the assistant said next.
-- Subagents are helper agents the session launched. Each one's task appears where it started (a Codex subagent's task is encrypted apart from its header), and its latest message where it was written, marked finished or unfinished. Their findings and dead ends count as this session's own.
+- Subagents are helper agents the session launched. Each one appears as its own summary, in these same fields, at the time it was last active. Their findings and dead ends count as this session's own: carry what matters into progress and tried with the subagent's exact names and errors. A subagent's suggestion is a next step only once this session takes it up. A subagent waiting on the user means this session waits on the user too.
 - When a "Summary so far" is given, the entries are only what happened after it. Return the whole updated summary: keep what is still true, add what the new entries show, and rewrite or drop what they made obsolete (a fixed blocker, an answered question, a step now done). Carry progress and tried items forward, merging related ones to stay within the limits; never drop a tried item just because the new entries don't mention it. The first user message is repeated so the objective stays anchored.
 
 Fields
@@ -614,7 +634,13 @@ Write plain text, one sentence per list item. Use exact names, never vague ones.
 - blockers: what stops progress right now: an unanswered question, an auto_denied call the session stalled on (it may need the user's manual approval or another approach), an error the session couldn't get past, something external. A dead end the session routed around belongs in tried, not here. Empty if nothing.
 - waiting_on: user when the session stopped for the user: an unanswered question or choice, an offer or proposal of more work, an approval, a permission, something only the user can do; external when it waits on something outside the session (CI, a review, a deploy, another team); none when it is still working, done or abandoned.
 - ask: when waiting_on is user, the exact question or decision, self-contained: what is being decided, the options the session offered and its recommendation, and the context needed to answer without the transcript. When the session ended by offering or proposing more work, the ask is that offer as a question the user can answer yes or no, such as "Push the branch and open a PR?". Never ask the user to approve a call they already denied. Otherwise null.
-- outcome: done only when nothing is left: the session's latest report says the work is finished and it proposes nothing further. A session that ends offering or proposing more work, such as pushing, opening a PR or a further fix, is not done: it is in_progress and waiting on the user, with the offer as the ask. abandoned when the user or the session gave up or moved on without finishing. in_progress otherwise, including while waiting on the user or on something external.`;
+- outcome: done only when nothing is left: the session's latest report says the work is finished and it proposes nothing further. A session that ends offering or proposing more work, such as pushing, opening a PR or a further fix, is not done: it is in_progress and waiting on the user, with the offer as the ask. abandoned when the user or the session gave up or moved on without finishing. in_progress otherwise, including while waiting on the user or on something external.
+
+Subagent sessions
+A subagent was given its task by another agent, and its report goes back to that agent, not to the user. Its user messages are that agent's instructions. Apply the fields as above, except:
+- objective: the task it was given. A Claude workflow agent gets the user's shared request and then its own computed task: the objective is the computed task. A Codex subagent's task is encrypted apart from its header: infer the objective from the task name and what the subagent did, and state it as the task, without saying how it was inferred.
+- An offer or suggestion in its report is for the agent that launched it, not an ask: the subagent is done when its report says the task is finished. A SubagentHandback call is that report going back, and the subagent stops after it.
+- waiting_on is user only when a person must act, such as approving a permission it stopped on.`;
 
 const SUMMARY_SCHEMA = {
 	type: "object",

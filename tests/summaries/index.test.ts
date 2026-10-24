@@ -33,10 +33,9 @@ test("a session without a summary is summarized from all its events, through its
 	);
 	expect(claude.requests[0]?.input).not.toContain("Summary so far");
 	expect(report).toEqual({
-		refreshed: 1,
+		roots: { refreshed: 1, calls: 1, inputTokens: 1_500 },
+		subagents: { refreshed: 0, calls: 0, inputTokens: 0 },
 		deferred: [],
-		calls: 1,
-		inputTokens: 1_500,
 		warnings: [],
 		failures: [],
 	});
@@ -71,7 +70,7 @@ test("a summary is refreshed only after new events, from the previous summary, t
 	]);
 	await refreshSummaries(app);
 
-	expect(unchanged.refreshed).toBe(0);
+	expect(unchanged.roots.refreshed).toBe(0);
 	expect(claude.requests).toHaveLength(2);
 	const input = claude.requests[1]?.input ?? "";
 	expect(input).toContain("## Summary so far");
@@ -83,11 +82,18 @@ test("a summary is refreshed only after new events, from the previous summary, t
 	expect(input).not.toContain("Starting with the schema.");
 });
 
-test("a subagent's task and final message feed its parent's summary where it ran, and its own new events make the parent stale", async () => {
-	const claude = fakeClaude();
+test("a subagent is summarized before its parent, and its summary feeds the parent's input where it was last active", async () => {
+	const claude = fakeClaude((request) =>
+		request.input.includes("Subagent of: claude:root")
+			? { ...SUMMARY, objective: "Look for dropped events in src/sync" }
+			: SUMMARY,
+	);
 	const app = createTestApp({ askClaude: claude.askClaude, now: () => NOW });
 	addSession(app, "claude:root");
-	addSession(app, "claude:agent", { parentId: "claude:root", state: "ended" });
+	addSession(app, "claude:agent", {
+		parentId: "claude:root",
+		lastEventAt: minutesAfterStart(8),
+	});
 	addEvents(app, "claude:root", [
 		message("user", "Find why sync drops events", 0),
 		toolCall("Task Explore sync", null, "ok", 1),
@@ -95,10 +101,53 @@ test("a subagent's task and final message feed its parent's summary where it ran
 	]);
 	addEvents(app, "claude:agent", [
 		message("user", "Look for dropped events in src/sync", 2),
-		message("assistant", "Let me grep for upserts.", 3),
 		toolCall("Grep onConflictDoUpdate", "onConflictDoUpdate", "ok", 4),
 		message("assistant", "No dropped events: every upsert keeps its id.", 8),
 	]);
+
+	const report = await refreshSummaries(app);
+
+	const [agent = "", root = ""] = claude.requests.map(
+		(request) => request.input,
+	);
+	expect(agent).toContain("Subagent of: claude:root");
+	expect(agent).toContain(
+		"[2026-10-23 09:04 tool, ok] Grep onConflictDoUpdate",
+	);
+	expect(
+		order(root, [
+			"Task Explore sync",
+			"[2026-10-23 09:08 subagent claude:agent's summary]\nobjective: Look for dropped events in src/sync",
+			"The explorer found nothing",
+		]),
+	).toBe(true);
+	expect(root).not.toContain("Grep onConflictDoUpdate");
+	expect(root).not.toContain("Subagent of");
+	expect(report).toMatchObject({
+		roots: { refreshed: 1, calls: 1 },
+		subagents: { refreshed: 1, calls: 1 },
+	});
+	expect(storedSummary(app, "claude:agent")?.objective).toBe(
+		"Look for dropped events in src/sync",
+	);
+});
+
+test("a subagent's new events refresh it and then its parent, whose update carries only that subagent's new summary", async () => {
+	const claude = fakeClaude((request, index) =>
+		request.input.includes("Subagent of")
+			? { ...SUMMARY, objective: `subagent summary ${index}` }
+			: SUMMARY,
+	);
+	const app = createTestApp({ askClaude: claude.askClaude, now: () => NOW });
+	addSession(app, "claude:root");
+	addSession(app, "claude:agent", { parentId: "claude:root" });
+	addSession(app, "claude:other", { parentId: "claude:root" });
+	addEvents(app, "claude:root", [
+		message("user", "Find why sync drops events", 0),
+		message("assistant", "Launching two explorers.", 1),
+	]);
+	addEvents(app, "claude:agent", [message("user", "Read src/sync", 2)]);
+	addEvents(app, "claude:other", [message("user", "Read src/app.ts", 2)]);
 	await refreshSummaries(app);
 	addEvents(app, "claude:agent", [
 		message("assistant", "Correction: the offset skips a line.", 10),
@@ -106,128 +155,110 @@ test("a subagent's task and final message feed its parent's summary where it ran
 
 	const report = await refreshSummaries(app);
 
-	const first = claude.requests[0]?.input ?? "";
-	expect(
-		order(first, [
-			"Task Explore sync",
-			"subagent claude:agent started] task:\nLook for dropped events in src/sync",
-			"subagent claude:agent finished]\nNo dropped events",
-			"The explorer found nothing",
-		]),
-	).toBe(true);
-	expect(first).not.toContain("Let me grep for upserts.");
-	expect(first).not.toContain("Grep onConflictDoUpdate");
-	expect(report.refreshed).toBe(1);
-	expect(claude.requests[1]?.input).toContain(
-		"subagent claude:agent finished]\nCorrection: the offset skips a line.",
+	expect(claude.requests).toHaveLength(5);
+	const [agent = "", root = ""] = claude.requests
+		.slice(3)
+		.map((request) => request.input);
+	expect(agent).toContain("Correction: the offset skips a line.");
+	expect(root).toContain("## Summary so far");
+	expect(root).toContain(
+		"subagent claude:agent's summary]\nobjective: subagent summary 3",
 	);
-	expect(claude.requests[1]?.input).not.toContain("Look for dropped events");
-	expect(storedSummary(app, "claude:agent")).toBeUndefined();
+	expect(root).not.toContain("claude:other");
+	expect(root).not.toContain("Launching two explorers.");
+	expect(report).toMatchObject({
+		roots: { refreshed: 1 },
+		subagents: { refreshed: 1 },
+	});
 });
 
-test("a subagent's own subagents feed the root's summary too", async () => {
+test("nested subagents are summarized deepest first, each feeding its own parent", async () => {
 	const claude = fakeClaude();
 	const app = createTestApp({ askClaude: claude.askClaude, now: () => NOW });
-	addSession(app, "codex:root");
-	addSession(app, "codex:agent", { parentId: "codex:root" });
-	addSession(app, "codex:nested", { parentId: "codex:agent" });
+	addSession(app, "codex:root", { harness: "codex" });
+	addSession(app, "codex:agent", { harness: "codex", parentId: "codex:root" });
+	addSession(app, "codex:nested", {
+		harness: "codex",
+		parentId: "codex:agent",
+		lastEventAt: minutesAfterStart(2),
+	});
 	addEvents(app, "codex:root", [message("user", "Audit the schema", 0)]);
 	addEvents(app, "codex:nested", [
 		message("user", "Check the events table", 1),
 		message("assistant", "The events table has no index on at.", 2),
 	]);
 
-	await refreshSummaries(app);
+	const report = await refreshSummaries(app);
 
-	expect(claude.requests).toHaveLength(1);
-	expect(claude.requests[0]?.input).toContain(
-		"subagent codex:nested finished]\nThe events table has no index on at.",
+	const [nested = "", agent = "", root = ""] = claude.requests.map(
+		(request) => request.input,
 	);
-	expect(storedSummary(app, "codex:agent")).toBeUndefined();
+	expect(nested).toContain("Subagent of: codex:agent");
+	expect(agent).toContain("Subagent of: codex:root");
+	expect(agent).toContain("subagent codex:nested's summary]");
+	expect(root).toContain("[2026-10-23 09:02 subagent codex:agent's summary]");
+	expect(root).not.toContain("codex:nested");
+	expect(report.subagents.refreshed).toBe(2);
 });
 
-test("a subagent's intermediate events advance its parent's summary without a call, keeping when it was written", async () => {
-	const claude = fakeClaude();
-	let now = NOW;
-	const app = createTestApp({ askClaude: claude.askClaude, now: () => now });
+test("a parent whose subagent's summary failed keeps its old summary and names the subagent it waits for", async () => {
+	const claude = fakeClaude((request) => {
+		if (request.input.includes("Subagent of")) {
+			throw new Error("claude -p exited with code 1: Overloaded");
+		}
+		return SUMMARY;
+	});
+	const app = createTestApp({ askClaude: claude.askClaude, now: () => NOW });
 	addSession(app, "claude:root");
-	addSession(app, "claude:agent", { parentId: "claude:root", state: "busy" });
 	addEvents(app, "claude:root", [message("user", "Audit the schema", 0)]);
-	addEvents(app, "claude:agent", [
-		message("user", "Read src/database.ts", 1),
-		message("assistant", "Reading it now.", 2),
-	]);
 	await refreshSummaries(app);
-	const [newest] = addEvents(app, "claude:agent", [
-		toolCall("Read src/database.ts", "src/database.ts", "ok", 3),
-	]);
-	now = new Date(+NOW + 60_000);
+	const before = storedSummary(app, "claude:root");
+	addSession(app, "claude:agent", { parentId: "claude:root" });
+	addEvents(app, "claude:agent", [message("user", "Read src/database.ts", 1)]);
 
 	const report = await refreshSummaries(app);
 
-	expect(report).toMatchObject({ refreshed: 1, calls: 0 });
-	expect(storedSummary(app, "claude:root")).toMatchObject({
-		throughEventId: newest,
-		updatedAt: NOW,
+	expect(claude.requests).toHaveLength(2);
+	expect(report.failures).toEqual([
+		{
+			sessionId: "claude:agent",
+			message: "claude -p exited with code 1: Overloaded",
+		},
+		{
+			sessionId: "claude:root",
+			message: "waits for subagent claude:agent, whose summary is behind",
+		},
+	]);
+	expect(storedSummary(app, "claude:root")).toEqual(before);
+});
+
+test("a busy root keeps its own and its subagents' summaries while its summary is younger than 15 minutes, and refreshes them all once it is older", async () => {
+	const claude = fakeClaude();
+	let now = NOW;
+	const app = createTestApp({ askClaude: claude.askClaude, now: () => now });
+	addSession(app, "claude:root", { state: "busy" });
+	addSession(app, "claude:agent", { parentId: "claude:root", state: "busy" });
+	addEvents(app, "claude:root", [message("user", "Add rolling summaries", 0)]);
+	addEvents(app, "claude:agent", [message("user", "Read src/database.ts", 1)]);
+	await refreshSummaries(app);
+	addEvents(app, "claude:agent", [message("assistant", "Still reading.", 2)]);
+
+	now = new Date(+NOW + 14 * 60_000);
+	const early = await refreshSummaries(app);
+	now = new Date(+NOW + 15 * 60_000);
+	const late = await refreshSummaries(app);
+
+	expect(early).toMatchObject({
+		roots: { refreshed: 0 },
+		subagents: { refreshed: 0 },
+		deferred: ["claude:root"],
 	});
-});
-
-test("a subagent's task is the last prompt before its first reply, and its latest message is finished only when nothing follows it", async () => {
-	const claude = fakeClaude();
-	const app = createTestApp({ askClaude: claude.askClaude, now: () => NOW });
-	addSession(app, "claude:root");
-	addSession(app, "claude:workflow", { parentId: "claude:root" });
-	addSession(app, "claude:working", { parentId: "claude:root" });
-	addEvents(app, "claude:root", [message("user", "Grade the essays", 0)]);
-	addEvents(app, "claude:workflow", [
-		message("user", "[Workflow harness — user request]\nGrade the essays", 1),
-		message("user", "[Workflow harness — computed task]\nGrade essay 3", 1),
-		message("assistant", "Essay 3 scores 4 of 6.", 2),
-	]);
-	addEvents(app, "claude:working", [
-		message("user", "Grade essay 4", 1),
-		message("assistant", "Running the rubric script now.", 2),
-		toolCall("Bash bun rubric.ts", "bun rubric.ts", "pending", 3),
-	]);
-
-	await refreshSummaries(app);
-
-	const input = claude.requests[0]?.input ?? "";
-	expect(input).toContain(
-		"subagent claude:workflow started] task:\n[Workflow harness — computed task]\nGrade essay 3",
-	);
-	expect(input).not.toContain("user request");
-	expect(input).toContain(
-		"subagent claude:workflow finished]\nEssay 3 scores 4 of 6.",
-	);
-	expect(input).toContain(
-		"subagent claude:working unfinished, latest message]\nRunning the rubric script now.",
-	);
-});
-
-test("a Codex subagent's encrypted task shows only its readable header", async () => {
-	const claude = fakeClaude();
-	const app = createTestApp({ askClaude: claude.askClaude, now: () => NOW });
-	addSession(app, "codex:root", { harness: "codex" });
-	addSession(app, "codex:agent", { harness: "codex", parentId: "codex:root" });
-	addEvents(app, "codex:root", [message("user", "Make some art", 0)]);
-	addEvents(app, "codex:agent", [
-		message(
-			"user",
-			"Message Type: NEW_TASK\nTask name: /root/artwork\nSender: /root\nPayload:\n[encrypted payload]",
-			1,
-		),
-		message("assistant", "Drew a lighthouse in art/lighthouse.svg.", 2),
-	]);
-
-	await refreshSummaries(app);
-
-	const input = claude.requests[0]?.input ?? "";
-	expect(input).toContain(
-		"subagent codex:agent started] task, encrypted apart from its header:\nMessage Type: NEW_TASK\nTask name: /root/artwork\nSender: /root\n",
-	);
-	expect(input).not.toContain("encrypted payload");
-	expect(input).not.toContain("Payload:");
+	expect(late).toMatchObject({
+		roots: { refreshed: 1 },
+		subagents: { refreshed: 1 },
+		deferred: [],
+	});
+	expect(claude.requests).toHaveLength(4);
 });
 
 test("a busy session keeps a summary younger than 15 minutes, and is refreshed once it is older", async () => {
@@ -244,8 +275,11 @@ test("a busy session keeps a summary younger than 15 minutes, and is refreshed o
 	now = new Date(+NOW + 15 * 60_000);
 	const late = await refreshSummaries(app);
 
-	expect(early).toMatchObject({ refreshed: 0, deferred: ["claude:root"] });
-	expect(late).toMatchObject({ refreshed: 1, deferred: [] });
+	expect(early).toMatchObject({
+		roots: { refreshed: 0 },
+		deferred: ["claude:root"],
+	});
+	expect(late).toMatchObject({ roots: { refreshed: 1 }, deferred: [] });
 	expect(claude.requests).toHaveLength(2);
 });
 
@@ -257,7 +291,10 @@ test("a busy session without a summary is summarized right away", async () => {
 
 	const report = await refreshSummaries(app);
 
-	expect(report).toMatchObject({ refreshed: 1, calls: 1, deferred: [] });
+	expect(report).toMatchObject({
+		roots: { refreshed: 1, calls: 1 },
+		deferred: [],
+	});
 });
 
 test("a session too long for one prompt is summarized in chunks, each after the first carrying the summary so far and the first user message", async () => {
@@ -276,7 +313,7 @@ test("a session too long for one prompt is summarized in chunks, each after the 
 
 	const report = await refreshSummaries(app);
 
-	expect(report.calls).toBe(2);
+	expect(report.roots.calls).toBe(2);
 	for (const request of claude.requests) {
 		expect(Buffer.byteLength(request.input)).toBeLessThan(CHUNK_BYTES);
 	}
@@ -306,7 +343,7 @@ test("text outside ASCII is chunked by its bytes, so a CJK session stays under t
 
 	const report = await refreshSummaries(app);
 
-	expect(report.calls).toBeGreaterThan(2);
+	expect(report.roots.calls).toBeGreaterThan(2);
 	for (const request of claude.requests) {
 		expect(Buffer.byteLength(request.input)).toBeLessThan(CHUNK_BYTES);
 	}
@@ -356,7 +393,7 @@ test("a failed call keeps the old summary, and the others still refresh", async 
 			message: "claude -p exited with code 1: Overloaded",
 		},
 	]);
-	expect(report.refreshed).toBe(1);
+	expect(report.roots.refreshed).toBe(1);
 	expect(storedSummary(app, "claude:one")).toEqual(before);
 });
 
@@ -379,7 +416,7 @@ test("a failure in a later chunk stores nothing", async () => {
 
 	const report = await refreshSummaries(app);
 
-	expect(report).toMatchObject({ refreshed: 0, calls: 1 });
+	expect(report).toMatchObject({ roots: { refreshed: 0, calls: 1 } });
 	expect(report.failures).toHaveLength(1);
 	expect(storedSummary(app, "claude:root")).toBeUndefined();
 });
@@ -463,7 +500,10 @@ test("a prompt over 100,000 tokens is reported, but a retried call whose prompts
 
 	const large = await refreshSummaries(app);
 
-	expect(retried).toMatchObject({ inputTokens: 160_000, warnings: [] });
+	expect(retried).toMatchObject({
+		roots: { inputTokens: 160_000 },
+		warnings: [],
+	});
 	expect(large.warnings).toEqual([
 		{
 			sessionId: "claude:large",
@@ -499,7 +539,7 @@ test("at most four calls run at once, and progress counts the sessions", async (
 
 	const report = await refreshSummaries(app);
 
-	expect(report.refreshed).toBe(6);
+	expect(report.roots.refreshed).toBe(6);
 	expect(mostRunning).toBe(4);
 	expect(progress).toEqual([
 		"summarizing 1/6",
