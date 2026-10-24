@@ -1,29 +1,20 @@
 import type { App } from "@src/app";
-import { events, sessions } from "@src/database";
+import {
+	events,
+	type StatusDatabase,
+	sessions,
+	summaries,
+} from "@src/database";
 import type {
 	Harness,
 	HarnessAdapter,
 	IngestedSource,
 	SessionEvent,
 	SessionRecord,
+	SessionSnapshot,
 	SourceRead,
 } from "@src/harnesses";
 import { and, eq, gte, inArray, ne, notInArray, or } from "drizzle-orm";
-
-export type SyncReport = {
-	sources: number;
-	sessions: number;
-	events: number;
-	warnings: SyncIssue[];
-	failures: SyncIssue[];
-};
-
-export type SyncIssue = {
-	harness: Harness;
-	step: "list" | "read" | "snapshot";
-	source: string | null;
-	message: string;
-};
 
 export async function sync(app: App, since: Date): Promise<SyncReport> {
 	const report: SyncReport = {
@@ -57,7 +48,10 @@ async function ingest(
 	app.progress(`syncing ${paths.length} ${harness} sources`);
 	for (const path of paths) {
 		try {
-			const read = await adapter.readSource(path, ingestedSource(app, path));
+			const read = await adapter.readSource(
+				path,
+				ingestedSource(app.database, path),
+			);
 			report.sources += 1;
 			if (read === null) {
 				continue;
@@ -65,7 +59,16 @@ async function ingest(
 			for (const message of read.warnings) {
 				report.warnings.push(issue(harness, "read", path, message));
 			}
-			const unmatchedResults = store(app, path, read);
+			if (read.continuedIn !== undefined) {
+				dropContinuedSession(
+					app.database,
+					path,
+					read.session.id,
+					read.continuedIn,
+				);
+				continue;
+			}
+			const unmatchedResults = store(app.database, path, read);
 			report.sessions += 1;
 			report.events += read.events.length - unmatchedResults.length;
 			for (const message of unmatchedResults) {
@@ -78,97 +81,53 @@ async function ingest(
 	return paths;
 }
 
-async function observe(
-	app: App,
-	adapter: HarnessAdapter,
-	since: Date,
-	listed: string[],
-	report: SyncReport,
-) {
-	const { harness } = adapter;
-	try {
-		const candidates = app.database
-			.select()
-			.from(sessions)
-			.where(
-				and(
-					eq(sessions.harness, harness),
-					or(
-						gte(sessions.lastEventAt, since),
-						ne(sessions.state, "ended"),
-						inArray(sessions.sourcePath, listed),
-					),
-				),
-			)
-			.all();
-		const snapshots = await adapter.snapshot(candidates.map(toRecord));
-		const candidateIds = new Set(candidates.map((row) => row.id));
-		const observedAt = app.now();
-		app.database.transaction((transaction) => {
-			for (const snapshot of snapshots) {
-				if (!candidateIds.has(snapshot.sessionId)) {
-					report.warnings.push(
-						issue(
-							harness,
-							"snapshot",
-							null,
-							`snapshot returned ${snapshot.sessionId}, which it wasn't asked about`,
-						),
-					);
-					continue;
-				}
-				transaction
-					.update(sessions)
-					.set({
-						state: snapshot.state,
-						cwd: snapshot.cwd,
-						branch: snapshot.branch,
-						observedAt,
-					})
-					.where(eq(sessions.id, snapshot.sessionId))
-					.run();
-			}
-			transaction
-				.update(sessions)
-				.set({ state: "ended", observedAt })
-				.where(
-					and(
-						inArray(sessions.id, [...candidateIds]),
-						notInArray(
-							sessions.id,
-							snapshots.map((snapshot) => snapshot.sessionId),
-						),
-						ne(sessions.state, "ended"),
-					),
-				)
-				.run();
-		});
-	} catch (error) {
-		report.failures.push(issue(harness, "snapshot", null, error));
-	}
-}
-
-function ingestedSource(app: App, path: string): IngestedSource | null {
-	const row = app.database
-		.select()
-		.from(sessions)
-		.where(eq(sessions.sourcePath, path))
-		.get();
+function ingestedSource(
+	database: StatusDatabase,
+	path: string,
+): IngestedSource | null {
+	const row = sessionBySourcePath(database, path);
 	return row ? { session: toRecord(row), readOffset: row.readOffset } : null;
 }
 
-function store(app: App, path: string, read: SourceRead): string[] {
-	const { session } = read;
-	return app.database.transaction(
+function dropContinuedSession(
+	database: StatusDatabase,
+	path: string,
+	replacedId: string,
+	continuationId: string,
+) {
+	database.transaction(
 		(transaction) => {
-			const stored = transaction
-				.select({
-					lastEventAt: sessions.lastEventAt,
-					sourcePath: sessions.sourcePath,
-				})
-				.from(sessions)
-				.where(eq(sessions.id, session.id))
-				.get();
+			const stored = storedSourceOf(transaction, replacedId);
+			if (stored && stored.sourcePath !== path) {
+				throw new Error(
+					`${replacedId} is already stored from ${stored.sourcePath}`,
+				);
+			}
+			transaction
+				.update(sessions)
+				.set({ parentId: continuationId })
+				.where(eq(sessions.parentId, replacedId))
+				.run();
+			transaction
+				.delete(summaries)
+				.where(eq(summaries.sessionId, replacedId))
+				.run();
+			transaction.delete(events).where(eq(events.sessionId, replacedId)).run();
+			transaction.delete(sessions).where(eq(sessions.id, replacedId)).run();
+		},
+		{ behavior: "immediate" },
+	);
+}
+
+function store(
+	database: StatusDatabase,
+	path: string,
+	read: SourceRead,
+): string[] {
+	const { session } = read;
+	return database.transaction(
+		(transaction) => {
+			const stored = storedSourceOf(transaction, session.id);
 			if (stored && stored.sourcePath !== path) {
 				throw new Error(
 					`${session.id} is already stored from ${stored.sourcePath}`,
@@ -178,70 +137,75 @@ function store(app: App, path: string, read: SourceRead): string[] {
 				stored?.lastEventAt ?? session.startedAt,
 				...read.events.map((event) => event.at),
 			]);
-			const transcriptFields = {
-				harness: session.harness,
-				surface: session.surface,
-				parentId: session.parentId,
-				title: session.title,
-				cwd: session.cwd,
-				branch: session.branch,
-				startedAt: session.startedAt,
+			upsertSession(transaction, session, {
 				lastEventAt,
 				sourcePath: path,
 				readOffset: read.nextOffset,
-			};
-			transaction
-				.insert(sessions)
-				.values({
-					id: session.id,
-					...transcriptFields,
-					state: "ended",
-					observedAt: lastEventAt,
-				})
-				.onConflictDoUpdate({ target: sessions.id, set: transcriptFields })
-				.run();
-
+			});
 			const unmatchedResults: string[] = [];
 			for (const event of read.events) {
-				if (event.kind === "tool_result") {
-					const updated = transaction
-						.update(events)
-						.set({ toolStatus: event.toolStatus })
-						.where(
-							and(
-								eq(events.sessionId, session.id),
-								eq(events.key, event.key),
-								eq(events.role, "tool"),
-							),
-						)
-						.returning({ id: events.id })
-						.all();
-					if (updated.length === 0) {
-						unmatchedResults.push(
-							`tool result ${event.key} has no stored call, so it was dropped`,
-						);
-					}
+				if (event.kind !== "tool_result") {
+					upsertEvent(transaction, session.id, event);
 					continue;
 				}
-				const fields = eventFields(event);
-				transaction
-					.insert(events)
-					.values({
-						sessionId: session.id,
-						key: event.key,
-						...fields,
-						toolStatus: event.kind === "tool_call" ? "pending" : null,
-					})
-					.onConflictDoUpdate({
-						target: [events.sessionId, events.key],
-						set: fields,
-					})
-					.run();
+				if (!finishToolCall(transaction, session.id, event)) {
+					unmatchedResults.push(
+						`tool result ${event.key} has no stored call, so it was dropped`,
+					);
+				}
 			}
 			return unmatchedResults;
 		},
 		{ behavior: "immediate" },
 	);
+}
+
+function upsertSession(
+	transaction: Transaction,
+	session: SessionRecord,
+	progress: { lastEventAt: Date; sourcePath: string; readOffset: number },
+) {
+	const transcriptFields = {
+		harness: session.harness,
+		surface: session.surface,
+		parentId: session.parentId,
+		title: session.title,
+		cwd: session.cwd,
+		branch: session.branch,
+		startedAt: session.startedAt,
+		...progress,
+	};
+	transaction
+		.insert(sessions)
+		.values({
+			id: session.id,
+			...transcriptFields,
+			state: "ended",
+			observedAt: progress.lastEventAt,
+		})
+		.onConflictDoUpdate({ target: sessions.id, set: transcriptFields })
+		.run();
+}
+
+function upsertEvent(
+	transaction: Transaction,
+	sessionId: string,
+	event: Exclude<SessionEvent, { kind: "tool_result" }>,
+) {
+	const fields = eventFields(event);
+	transaction
+		.insert(events)
+		.values({
+			sessionId,
+			key: event.key,
+			...fields,
+			toolStatus: event.kind === "tool_call" ? "pending" : null,
+		})
+		.onConflictDoUpdate({
+			target: [events.sessionId, events.key],
+			set: fields,
+		})
+		.run();
 }
 
 function eventFields(event: Exclude<SessionEvent, { kind: "tool_result" }>) {
@@ -257,7 +221,113 @@ function eventFields(event: Exclude<SessionEvent, { kind: "tool_result" }>) {
 	};
 }
 
-function toRecord(row: typeof sessions.$inferSelect): SessionRecord {
+function finishToolCall(
+	transaction: Transaction,
+	sessionId: string,
+	result: Extract<SessionEvent, { kind: "tool_result" }>,
+): boolean {
+	const updated = transaction
+		.update(events)
+		.set({ toolStatus: result.toolStatus })
+		.where(
+			and(
+				eq(events.sessionId, sessionId),
+				eq(events.key, result.key),
+				eq(events.role, "tool"),
+			),
+		)
+		.returning({ id: events.id })
+		.all();
+	return updated.length > 0;
+}
+
+async function observe(
+	app: App,
+	adapter: HarnessAdapter,
+	since: Date,
+	listed: string[],
+	report: SyncReport,
+) {
+	const { harness } = adapter;
+	try {
+		const candidates = recentlyActiveSessions(
+			app.database,
+			harness,
+			since,
+			listed,
+		);
+		const { snapshots, warnings } = await adapter.snapshot(
+			candidates.map(toRecord),
+		);
+		for (const message of warnings) {
+			report.warnings.push(issue(harness, "snapshot", null, message));
+		}
+		const candidateIds = new Set(candidates.map((row) => row.id));
+		const observedAt = app.now();
+		app.database.transaction((transaction) => {
+			for (const snapshot of snapshots) {
+				if (!candidateIds.has(snapshot.sessionId)) {
+					report.warnings.push(
+						issue(
+							harness,
+							"snapshot",
+							null,
+							`snapshot returned ${snapshot.sessionId}, which it wasn't asked about`,
+						),
+					);
+					continue;
+				}
+				recordLiveState(transaction, snapshot, observedAt);
+			}
+			endUnseenSessions(
+				transaction,
+				[...candidateIds],
+				snapshots.map((snapshot) => snapshot.sessionId),
+				observedAt,
+			);
+		});
+	} catch (error) {
+		report.failures.push(issue(harness, "snapshot", null, error));
+	}
+}
+
+function recordLiveState(
+	transaction: Transaction,
+	snapshot: SessionSnapshot,
+	observedAt: Date,
+) {
+	transaction
+		.update(sessions)
+		.set({
+			state: snapshot.state,
+			cwd: snapshot.cwd,
+			branch: snapshot.branch,
+			observedAt,
+		})
+		.where(eq(sessions.id, snapshot.sessionId))
+		.run();
+}
+
+function endUnseenSessions(
+	transaction: Transaction,
+	candidateIds: string[],
+	seenIds: string[],
+	observedAt: Date,
+) {
+	transaction
+		.update(sessions)
+		.set({ state: "ended", observedAt })
+		.where(
+			and(
+				inArray(sessions.id, candidateIds),
+				notInArray(sessions.id, seenIds),
+				ne(sessions.state, "ended"),
+			),
+		)
+		.run();
+}
+
+function toRecord(row: StoredSession): SessionRecord {
 	return {
 		id: row.id,
 		harness: row.harness,
@@ -286,3 +356,66 @@ function issue(
 	const message = problem instanceof Error ? problem.message : String(problem);
 	return { harness, step, source, message };
 }
+
+function sessionBySourcePath(
+	database: StatusDatabase,
+	path: string,
+): StoredSession | undefined {
+	return database
+		.select()
+		.from(sessions)
+		.where(eq(sessions.sourcePath, path))
+		.get();
+}
+
+function storedSourceOf(transaction: Transaction, sessionId: string) {
+	return transaction
+		.select({
+			lastEventAt: sessions.lastEventAt,
+			sourcePath: sessions.sourcePath,
+		})
+		.from(sessions)
+		.where(eq(sessions.id, sessionId))
+		.get();
+}
+
+function recentlyActiveSessions(
+	database: StatusDatabase,
+	harness: Harness,
+	since: Date,
+	listed: string[],
+): StoredSession[] {
+	return database
+		.select()
+		.from(sessions)
+		.where(
+			and(
+				eq(sessions.harness, harness),
+				or(
+					gte(sessions.lastEventAt, since),
+					ne(sessions.state, "ended"),
+					inArray(sessions.sourcePath, listed),
+				),
+			),
+		)
+		.all();
+}
+
+export type SyncReport = {
+	sources: number;
+	sessions: number;
+	events: number;
+	warnings: SyncIssue[];
+	failures: SyncIssue[];
+};
+
+export type SyncIssue = {
+	harness: Harness;
+	step: "list" | "read" | "snapshot";
+	source: string | null;
+	message: string;
+};
+
+type StoredSession = typeof sessions.$inferSelect;
+
+type Transaction = Parameters<Parameters<StatusDatabase["transaction"]>[0]>[0];

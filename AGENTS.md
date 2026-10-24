@@ -27,7 +27,7 @@
   `createApp(environment)` builds it and opens `<status>/status.db`.
 - **`src/harnesses/` owns the session contract** and one adapter per harness (`src/harnesses/AGENTS.md`).
 - **`src/sync/` pulls what the adapters read into `sessions` and `events`** and owns every write to them (`src/sync/AGENTS.md`).
-- **`src/summaries/` keeps one rolling Haiku summary per root session,** with its subagents folded in, and owns every read and write of `summaries` (`src/summaries/AGENTS.md`).
+- **`src/summaries/` keeps one rolling Haiku summary per session,** subagents included, each subagent's feeding its parent's, and owns every read and write of `summaries`, except that sync deletes the summary of a session it drops as continued (`src/summaries/AGENTS.md`).
 - **`src/database.ts` owns the schema,** and `drizzle/` holds its generated migrations.
 - **`src/utils.ts` holds `askClaude`,** the `claude -p` runner.
 - **`src/cli/` parses arguments and runs the commands** (`src/cli/AGENTS.md`).

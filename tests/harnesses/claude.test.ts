@@ -250,6 +250,50 @@ test("tool calls become headlines, and their results carry ok, error or user_den
 	]);
 });
 
+test("a tool call that carries the agent's own words also becomes its message", async () => {
+	const { claude } = createTemporaryHome();
+	const path = transcriptPath(claude);
+	await writeLines(path, [
+		userLine({ text: "go" }),
+		assistantLine([
+			toolUse("h1", "SubagentHandback", { message: "Fixed the build." }),
+		]),
+		assistantLine([
+			toolUse("s1", "SendMessage", { to: "main", message: "Need a go-ahead." }),
+		]),
+		assistantLine([
+			toolUse("q1", "AskUserQuestion", {
+				questions: [
+					{
+						question: "Which town?",
+						header: "Setting",
+						options: [{ label: "Tyre" }, { label: "Sidon" }],
+					},
+				],
+			}),
+		]),
+		assistantLine([toolUse("e1", "SubagentHandback", { message: "  " })]),
+	]);
+
+	const read = await createClaudeAdapter(claude).readSource(path, null);
+
+	expect(read?.events.slice(1)).toMatchObject([
+		{ kind: "tool_call", key: "h1", text: "SubagentHandback" },
+		{
+			kind: "message",
+			key: "h1:spoken",
+			role: "assistant",
+			text: "Fixed the build.",
+		},
+		{ kind: "tool_call", key: "s1" },
+		{ kind: "message", key: "s1:spoken", text: "To main: Need a go-ahead." },
+		{ kind: "tool_call", key: "q1" },
+		{ kind: "message", key: "q1:spoken", text: "Which town?\n- Tyre\n- Sidon" },
+		{ kind: "tool_call", key: "e1" },
+	]);
+	expect(read?.events).toHaveLength(8);
+});
+
 test("a refusal by the auto-mode classifier or the safety check is auto_denied", async () => {
 	const { claude } = createTemporaryHome();
 	const path = transcriptPath(claude);
@@ -457,19 +501,21 @@ test("snapshot reports live root sessions with their state, directory and branch
 		record({ id: `claude:${id}`, cwd: id === "busy" ? repo : "/nowhere" }),
 	);
 
-	const snapshot = await createClaudeAdapter(claude).snapshot(sessions);
+	const { snapshots, warnings } =
+		await createClaudeAdapter(claude).snapshot(sessions);
 
-	expect(snapshot).toEqual([
+	expect(snapshots).toEqual([
 		{ sessionId: "claude:busy", state: "busy", cwd: repo, branch: "feature" },
 		{ sessionId: "claude:shell", state: "busy", cwd: "/nowhere", branch: null },
 		{
 			sessionId: "claude:waiting",
-			state: "idle",
+			state: "waiting",
 			cwd: "/nowhere",
 			branch: null,
 		},
 		{ sessionId: "claude:job", state: "idle", cwd: "/nowhere", branch: null },
 	]);
+	expect(warnings).toEqual([]);
 });
 
 test("a subagent is busy while its parent is live and its transcript changed in the last 2 minutes", async () => {
@@ -516,9 +562,9 @@ test("a subagent is busy while its parent is live and its transcript changed in 
 		}),
 	];
 
-	const snapshot = await createClaudeAdapter(claude).snapshot(sessions);
+	const { snapshots } = await createClaudeAdapter(claude).snapshot(sessions);
 
-	expect(snapshot).toEqual([
+	expect(snapshots).toEqual([
 		{ sessionId: "claude:running", state: "busy", cwd: repo, branch: "stream" },
 	]);
 });
@@ -527,13 +573,163 @@ test("a live session without a directory has no branch, not the branch status ru
 	const { claude } = createTemporaryHome();
 	await writeSessionFile(claude, 1, { sessionId: "rootless" });
 
-	const snapshot = await createClaudeAdapter(claude).snapshot([
+	const { snapshots } = await createClaudeAdapter(claude).snapshot([
 		record({ id: "claude:rootless", cwd: "" }),
 	]);
 
-	expect(snapshot).toEqual([
+	expect(snapshots).toEqual([
 		{ sessionId: "claude:rootless", state: "idle", cwd: "", branch: null },
 	]);
+});
+
+test("a pid counts only when its process started when the pid file says", async () => {
+	const { claude } = createTemporaryHome();
+	await writeSessionFile(claude, 1, {
+		sessionId: "same",
+		procStart: await ownProcessStart(),
+	});
+	await writeSessionFile(claude, 2, {
+		sessionId: "reused",
+		procStart: "Thu Jan  1 00:00:00 2026",
+	});
+
+	const { snapshots, warnings } = await createClaudeAdapter(claude).snapshot([
+		record({ id: "claude:same" }),
+		record({ id: "claude:reused" }),
+	]);
+
+	expect(snapshots.map((snapshot) => snapshot.sessionId)).toEqual([
+		"claude:same",
+	]);
+	expect(warnings).toEqual([]);
+});
+
+test("without ps, a live pid still counts and the snapshot warns", async () => {
+	const { claude } = createTemporaryHome();
+	await writeSessionFile(claude, 1, {
+		sessionId: "reused",
+		procStart: "Thu Jan  1 00:00:00 2026",
+	});
+	const script = join(claude, "snapshot.ts");
+	await Bun.write(
+		script,
+		[
+			`import { createClaudeAdapter } from ${JSON.stringify(HARNESSES)};`,
+			`const read = await createClaudeAdapter(${JSON.stringify(claude)}).snapshot(${JSON.stringify([record({ id: "claude:reused" })])});`,
+			"process.stdout.write(JSON.stringify(read));",
+		].join("\n"),
+	);
+
+	const child = Bun.spawn([process.execPath, script], {
+		env: { PATH: "" },
+		stderr: "pipe",
+	});
+	const read = JSON.parse(await new Response(child.stdout).text());
+
+	expect(await child.exited).toBe(0);
+	expect(
+		read.snapshots.map((snapshot: { sessionId: string }) => snapshot.sessionId),
+	).toEqual(["claude:reused"]);
+	expect(read.warnings).toHaveLength(1);
+	expect(read.warnings[0]).toStartWith(
+		"couldn't match Claude pids to their start times",
+	);
+});
+
+test("a transcript continued in another session reads as replaced by the latest continuation", async () => {
+	const { claude } = createTemporaryHome();
+	const project = join(claude, "projects", "-work-repo");
+	const original = join(project, "original.jsonl");
+	const job = join(project, "job.jsonl");
+	const later = join(project, "later.jsonl");
+	await writeLines(original, [
+		userLine({ text: "start", sessionId: "original" }),
+		continuedIn("original", "job"),
+	]);
+	await writeLines(job, [
+		userLine({ text: "start", sessionId: "job" }),
+		continuedIn("job", "later"),
+	]);
+	await writeLines(later, [userLine({ text: "start", sessionId: "later" })]);
+	const adapter = createClaudeAdapter(claude);
+
+	const read = await adapter.readSource(original, null);
+	const ingestedPastTheLine = await adapter.readSource(original, {
+		session: read?.session as SessionRecord,
+		readOffset: Bun.file(original).size,
+	});
+
+	expect(read?.session.id).toBe("claude:original");
+	expect(read?.continuedIn).toBe("claude:later");
+	expect(read?.events).toEqual([]);
+	expect(ingestedPastTheLine?.continuedIn).toBe("claude:later");
+	expect((await adapter.readSource(later, null))?.continuedIn).toBeUndefined();
+});
+
+test("a continuation that can't be ingested yet doesn't replace anything", async () => {
+	const { claude } = createTemporaryHome();
+	const project = join(claude, "projects", "-work-repo");
+	const adapter = createClaudeAdapter(claude);
+	const continuedTo = async (continuation: string) => {
+		const original = join(project, `before-${continuation}.jsonl`);
+		await writeLines(original, [
+			userLine({ text: "start", sessionId: `before-${continuation}` }),
+			continuedIn(`before-${continuation}`, continuation),
+		]);
+		return (await adapter.readSource(original, null))?.continuedIn;
+	};
+	await writeLines(join(project, "headless.jsonl"), [
+		{ type: "mode", sessionId: "headless" },
+	]);
+	await writeLines(join(project, "scripted.jsonl"), [
+		userLine({ text: "start", sessionId: "scripted", entrypoint: "sdk-cli" }),
+	]);
+
+	expect(await continuedTo("unwritten")).toBeUndefined();
+	expect(await continuedTo("headless")).toBeUndefined();
+	expect(await continuedTo("scripted")).toBeUndefined();
+});
+
+test("continuations that loop back replace neither session", async () => {
+	const { claude } = createTemporaryHome();
+	const project = join(claude, "projects", "-work-repo");
+	const original = join(project, "original.jsonl");
+	const job = join(project, "job.jsonl");
+	await writeLines(original, [
+		userLine({ text: "start", sessionId: "original" }),
+		continuedIn("original", "job"),
+	]);
+	await writeLines(job, [
+		userLine({ text: "start", sessionId: "job" }),
+		continuedIn("job", "original"),
+	]);
+	const adapter = createClaudeAdapter(claude);
+
+	expect(
+		(await adapter.readSource(original, null))?.continuedIn,
+	).toBeUndefined();
+	expect((await adapter.readSource(job, null))?.continuedIn).toBeUndefined();
+});
+
+test("a continued session's subagent belongs to the continuation", async () => {
+	const { claude } = createTemporaryHome();
+	const project = join(claude, "projects", "-work-repo");
+	await writeLines(join(project, "original.jsonl"), [
+		userLine({ text: "start", sessionId: "original" }),
+		continuedIn("original", "job"),
+	]);
+	await writeLines(join(project, "job.jsonl"), [
+		userLine({ text: "start", sessionId: "job" }),
+	]);
+	const subagent = join(project, "original", "subagents", "agent-a1.jsonl");
+	await writeLines(subagent, [
+		userLine({ text: "task", sessionId: "original", agentId: "a1" }),
+	]);
+
+	const read = await createClaudeAdapter(claude).readSource(subagent, null);
+
+	expect(read?.session.parentId).toBe("claude:job");
+	expect(read?.continuedIn).toBeUndefined();
 });
 
 function transcriptPath(claude: string): string {
@@ -650,6 +846,22 @@ async function createRepository(
 	return repo;
 }
 
+function continuedIn(sessionId: string, continuation: string) {
+	return {
+		type: "continued-in",
+		timestamp: AT,
+		sessionId,
+		continuedInSessionId: continuation,
+	};
+}
+
+async function ownProcessStart(): Promise<string> {
+	const output = await Bun.$`ps -o lstart= -p ${process.pid}`
+		.env({ ...process.env, LC_ALL: "C", TZ: "UTC" })
+		.text();
+	return output.trim();
+}
+
 async function exitedPid(): Promise<number> {
 	const child = Bun.spawn(["true"]);
 	await child.exited;
@@ -659,3 +871,12 @@ async function exitedPid(): Promise<number> {
 const SESSION_ID = "11111111-2222-3333-4444-555555555555";
 
 const AT = "2026-10-23T10:00:00.000Z";
+
+const HARNESSES = join(
+	import.meta.dir,
+	"..",
+	"..",
+	"src",
+	"harnesses",
+	"index.ts",
+);

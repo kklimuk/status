@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { events, sessions } from "@src/database";
+import { events, sessions, summaries } from "@src/database";
 import type {
 	HarnessAdapter,
 	IngestedSource,
@@ -351,15 +351,97 @@ test("an adapter's warnings are reported against their source", async () => {
 	expect(report.failures).toEqual([]);
 });
 
+test("a continued session is replaced by its continuation, rows stored before included", async () => {
+	const adapter = createFakeAdapter();
+	adapter.write(record("claude:original"), [
+		message("m1", 1),
+		toolCall("c1", 2),
+	]);
+	adapter.write({ ...record("claude:agent"), parentId: "claude:original" }, [
+		message("m1", 2),
+	]);
+	const app = createTestApp({ adapters: [adapter] });
+	await sync(app, SINCE);
+	storeSummary(app, "claude:original");
+
+	adapter.continueIn("claude:original", "claude:job");
+	adapter.write(record("claude:job"), [message("m1", 1), toolCall("c1", 2)]);
+	const report = await sync(app, SINCE);
+
+	expect(storedSession(app, "claude:original")).toBeUndefined();
+	expect(
+		storedEvents(app).filter((event) => event.sessionId === "claude:original"),
+	).toEqual([]);
+	expect(app.database.select().from(summaries).all()).toEqual([]);
+	expect(storedSession(app, "claude:agent")?.parentId).toBe("claude:job");
+	expect(storedSession(app, "claude:job")).toBeDefined();
+	expect(report.failures).toEqual([]);
+});
+
+test("a session continued before its first sync is never stored", async () => {
+	const adapter = createFakeAdapter();
+	adapter.write(record("claude:original"), [message("m1", 1)]);
+	adapter.continueIn("claude:original", "claude:job");
+	const app = createTestApp({ adapters: [adapter] });
+
+	const report = await sync(app, SINCE);
+
+	expect(storedRows(app)).toEqual({ sessions: [], events: [] });
+	expect(report).toMatchObject({ sources: 1, sessions: 0, failures: [] });
+});
+
+test("a continued read from a second source fails without dropping the stored session", async () => {
+	const adapter = createFakeAdapter();
+	adapter.write(record("claude:one"), [message("m1", 1)]);
+	adapter.write({ ...record("claude:two"), id: "claude:one" }, []);
+	adapter.continueIn("claude:two", "claude:job");
+	const app = createTestApp({ adapters: [adapter] });
+
+	const report = await sync(app, SINCE);
+
+	expect(report.failures).toHaveLength(1);
+	expect(report.failures[0]?.message).toBe(
+		"claude:one is already stored from /sources/claude:one.jsonl",
+	);
+	expect(storedSession(app, "claude:one")).toBeDefined();
+	expect(storedEvents(app)).toHaveLength(1);
+});
+
+test("snapshot warnings are reported without a source", async () => {
+	const adapter = createFakeAdapter();
+	adapter.write(record("claude:one"), [message("m1", 1)]);
+	adapter.live = [snapshot("claude:one", "busy")];
+	adapter.snapshotWarnings = ["ps exited 2: boom"];
+	const app = createTestApp({ adapters: [adapter] });
+
+	const report = await sync(app, SINCE);
+
+	expect(report.warnings).toEqual([
+		{
+			harness: "claude",
+			step: "snapshot",
+			source: null,
+			message: "ps exited 2: boom",
+		},
+	]);
+	expect(storedSession(app, "claude:one")?.state).toBe("busy");
+});
+
 function createFakeAdapter(harness: HarnessAdapter["harness"] = "claude") {
 	const transcripts = new Map<
 		string,
-		{ session: SessionRecord; events: SessionEvent[]; rewritten: boolean }
+		{
+			session: SessionRecord;
+			events: SessionEvent[];
+			rewritten: boolean;
+			continuedIn?: string;
+		}
 	>();
 	const adapter: FakeAdapter = {
 		harness,
 		live: [] as SessionSnapshot[],
 		warnings: [] as string[],
+		snapshotWarnings: [] as string[],
 		reads: [] as { path: string; ingested: IngestedSource | null }[],
 		snapshotRequests: [] as string[][],
 		write(session: SessionRecord, sessionEvents: SessionEvent[]) {
@@ -371,6 +453,12 @@ function createFakeAdapter(harness: HarnessAdapter["harness"] = "claude") {
 		},
 		append(id: string, sessionEvents: SessionEvent[]) {
 			transcripts.get(sourcePath(id))?.events.push(...sessionEvents);
+		},
+		continueIn(id: string, continuationId: string) {
+			const transcript = transcripts.get(sourcePath(id));
+			if (transcript) {
+				transcript.continuedIn = continuationId;
+			}
 		},
 		rewrite(id: string) {
 			const transcript = transcripts.get(sourcePath(id));
@@ -387,6 +475,15 @@ function createFakeAdapter(harness: HarnessAdapter["harness"] = "claude") {
 			if (!transcript) {
 				return null;
 			}
+			if (transcript.continuedIn) {
+				return {
+					session: transcript.session,
+					events: [],
+					nextOffset: 0,
+					warnings: adapter.warnings,
+					continuedIn: transcript.continuedIn,
+				};
+			}
 			const resumed = ingested !== null && !transcript.rewritten;
 			transcript.rewritten = false;
 			return {
@@ -398,7 +495,7 @@ function createFakeAdapter(harness: HarnessAdapter["harness"] = "claude") {
 		},
 		async snapshot(requested: SessionRecord[]) {
 			adapter.snapshotRequests.push(requested.map((session) => session.id));
-			return adapter.live;
+			return { snapshots: adapter.live, warnings: adapter.snapshotWarnings };
 		},
 	};
 	return adapter;
@@ -407,10 +504,12 @@ function createFakeAdapter(harness: HarnessAdapter["harness"] = "claude") {
 type FakeAdapter = HarnessAdapter & {
 	live: SessionSnapshot[];
 	warnings: string[];
+	snapshotWarnings: string[];
 	reads: { path: string; ingested: IngestedSource | null }[];
 	snapshotRequests: string[][];
 	write(session: SessionRecord, sessionEvents: SessionEvent[]): void;
 	append(id: string, sessionEvents: SessionEvent[]): void;
+	continueIn(id: string, continuationId: string): void;
 	rewrite(id: string): void;
 };
 
@@ -481,6 +580,28 @@ function storedEvents(app: ReturnType<typeof createTestApp>) {
 
 function storedSession(app: ReturnType<typeof createTestApp>, id: string) {
 	return app.database.select().from(sessions).where(eq(sessions.id, id)).get();
+}
+
+function storeSummary(
+	app: ReturnType<typeof createTestApp>,
+	sessionId: string,
+) {
+	app.database
+		.insert(summaries)
+		.values({
+			sessionId,
+			throughEventId: 1,
+			objective: "fix the build",
+			progress: "",
+			tried: "",
+			next: "",
+			blockers: "",
+			waitingOn: "none",
+			ask: null,
+			outcome: "in_progress",
+			updatedAt: atMinute(3),
+		})
+		.run();
 }
 
 function atMinute(minute: number): Date {

@@ -8,7 +8,7 @@ export type HarnessAdapter = {
 		path: string,
 		ingested: IngestedSource | null,
 	): Promise<SourceRead | null>;
-	snapshot(sessions: SessionRecord[]): Promise<SessionSnapshot[]>;
+	snapshot(sessions: SessionRecord[]): Promise<SnapshotRead>;
 };
 
 export type IngestedSource = {
@@ -20,6 +20,12 @@ export type SourceRead = {
 	session: SessionRecord;
 	events: SessionEvent[];
 	nextOffset: number;
+	warnings: string[];
+	continuedIn?: string;
+};
+
+export type SnapshotRead = {
+	snapshots: SessionSnapshot[];
 	warnings: string[];
 };
 

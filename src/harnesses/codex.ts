@@ -16,7 +16,10 @@ export function createCodexAdapter(home: string): HarnessAdapter {
 		harness: "codex",
 		listSources: (since) => listRollouts(home, since),
 		readSource: (path, ingested) => readRollout(home, path, ingested),
-		snapshot: (sessions) => snapshotThreads(home, sessions),
+		snapshot: async (sessions) => ({
+			snapshots: await snapshotThreads(home, sessions),
+			warnings: [],
+		}),
 	};
 }
 

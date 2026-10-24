@@ -448,7 +448,7 @@ test("snapshot reports threads whose writer lock is held, busy until the turn en
 	holdLock(home.codex, CHILD);
 	await Bun.write(join(home.codex, "thread-writer-locks", `${ended}.lock`), "");
 
-	const snapshots = await createCodexAdapter(home.codex).snapshot([
+	const { snapshots } = await createCodexAdapter(home.codex).snapshot([
 		record(PARENT, busy),
 		record(CHILD, idle),
 		record(ended, endedPath),
@@ -473,7 +473,10 @@ test("snapshot reports threads whose writer lock is held, busy until the turn en
 test("snapshot is empty when no thread holds a lock", async () => {
 	const home = createTemporaryHome();
 
-	expect(await createCodexAdapter(home.codex).snapshot([])).toEqual([]);
+	expect(await createCodexAdapter(home.codex).snapshot([])).toEqual({
+		snapshots: [],
+		warnings: [],
+	});
 });
 
 function meta(id: string, overrides: Record<string, unknown> = {}) {

@@ -1,7 +1,7 @@
 import { Glob } from "bun";
 import type { Stats } from "fs";
 import { lstat, stat } from "fs/promises";
-import { join } from "path";
+import { dirname, join, sep } from "path";
 import type {
 	HarnessAdapter,
 	IngestedSource,
@@ -9,6 +9,7 @@ import type {
 	SessionRecord,
 	SessionSnapshot,
 	SessionState,
+	SnapshotRead,
 	SourceRead,
 	ToolStatus,
 } from ".";
@@ -70,13 +71,25 @@ async function readTranscript(
 	if (!head || isScripted(head.entrypoint)) {
 		return null;
 	}
+	const session = await startRecord(path, head, ingested?.session ?? null);
+	if (head.agentId === null) {
+		const continuation = await latestContinuation(path);
+		if (continuation !== null) {
+			return {
+				session,
+				events: [],
+				nextOffset: 0,
+				warnings: [],
+				continuedIn: `claude:${continuation}`,
+			};
+		}
+	}
 	const size = file.size;
 	const start =
 		ingested && ingested.readOffset <= size ? ingested.readOffset : 0;
 	const bytes = new Uint8Array(await file.slice(start, size).arrayBuffer());
 	const end = bytes.lastIndexOf(NEWLINE) + 1;
 
-	const session = await startRecord(path, head, ingested?.session ?? null);
 	const events: SessionEvent[] = [];
 	let unparseable = 0;
 	for (const line of completeLines(bytes.subarray(0, end))) {
@@ -93,10 +106,6 @@ async function readTranscript(
 		warnings.push(`skipped ${unparseable} unparseable lines in ${path}`);
 	}
 	return { session, events, nextOffset: start + end, warnings };
-}
-
-function isScripted(entrypoint: unknown): boolean {
-	return typeof entrypoint === "string" && entrypoint.startsWith(SDK_PREFIX);
 }
 
 async function readHead(file: Bun.BunFile): Promise<Head | null> {
@@ -128,6 +137,10 @@ async function readHead(file: Bun.BunFile): Promise<Head | null> {
 	}
 }
 
+function isScripted(entrypoint: unknown): boolean {
+	return typeof entrypoint === "string" && entrypoint.startsWith(SDK_PREFIX);
+}
+
 async function startRecord(
 	path: string,
 	head: Head,
@@ -141,11 +154,12 @@ async function startRecord(
 	};
 	const meta = isSubagent ? await readSubagentMeta(path) : null;
 	const description = meta?.description;
+	const root = isSubagent ? await subagentRoot(path, head.sessionId) : null;
 	return {
 		id: `claude:${head.agentId ?? head.sessionId}`,
 		harness: "claude",
 		surface: "unknown",
-		parentId: isSubagent ? `claude:${head.sessionId}` : null,
+		parentId: root === null ? null : `claude:${root}`,
 		title: typeof description === "string" ? description : base.title,
 		cwd: base.cwd,
 		branch: base.branch,
@@ -160,6 +174,75 @@ async function readSubagentMeta(path: string): Promise<SubagentMeta | null> {
 	} catch {
 		return null;
 	}
+}
+
+async function subagentRoot(path: string, sessionId: string): Promise<string> {
+	const marker = `${sep}${sessionId}${sep}subagents${sep}`;
+	const index = path.lastIndexOf(marker);
+	if (index === -1) {
+		return sessionId;
+	}
+	const rootTranscript = `${path.slice(0, index)}${sep}${sessionId}.jsonl`;
+	return (await latestContinuation(rootTranscript)) ?? sessionId;
+}
+
+async function latestContinuation(transcript: string): Promise<string | null> {
+	let latest: string | null = null;
+	let path = transcript;
+	const visited = new Set([path]);
+	for (;;) {
+		const next = await continuedInId(path);
+		if (next === null) {
+			return latest;
+		}
+		const nextPath = join(dirname(path), `${next}.jsonl`);
+		if (visited.has(nextPath)) {
+			return null;
+		}
+		if (!(await isIngestible(nextPath))) {
+			return latest;
+		}
+		visited.add(nextPath);
+		latest = next;
+		path = nextPath;
+	}
+}
+
+async function isIngestible(path: string): Promise<boolean> {
+	const file = Bun.file(path);
+	if (!(await file.exists())) {
+		return false;
+	}
+	const head = await readHead(file);
+	return head !== null && !isScripted(head.entrypoint);
+}
+
+async function continuedInId(path: string): Promise<string | null> {
+	const file = Bun.file(path);
+	let bytes: Uint8Array;
+	try {
+		const start = Math.max(0, file.size - CONTINUATION_TAIL_BYTES);
+		bytes = new Uint8Array(await file.slice(start).arrayBuffer());
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return null;
+		}
+		throw error;
+	}
+	const end = bytes.lastIndexOf(NEWLINE) + 1;
+	const candidates = completeLines(bytes.subarray(0, end)).filter((line) =>
+		line.includes(CONTINUED_IN_MARKER),
+	);
+	for (const line of candidates.reverse()) {
+		const entry = parseEntry(line);
+		if (
+			entry?.type === "continued-in" &&
+			typeof entry.continuedInSessionId === "string"
+		) {
+			return entry.continuedInSessionId;
+		}
+	}
+	return null;
 }
 
 function completeLines(bytes: Uint8Array): string[] {
@@ -250,6 +333,16 @@ function assistantEvents(
 				toolName,
 				toolTarget,
 			});
+			const spoken = spokenText(toolName, block.input);
+			if (spoken !== null) {
+				events.push({
+					kind: "message",
+					key: `${block.id}:spoken`,
+					at,
+					role: "assistant",
+					text: spoken,
+				});
+			}
 		}
 	}
 	const text = texts.join("\n\n").trim();
@@ -270,6 +363,41 @@ function toolTargetOf(input: unknown): string | null {
 		}
 	}
 	return null;
+}
+
+function spokenText(toolName: string, input: unknown): string | null {
+	if (typeof input !== "object" || input === null) {
+		return null;
+	}
+	const { message, to, questions } = input as Record<string, unknown>;
+	if (toolName === "SubagentHandback") {
+		return nonEmpty(message);
+	}
+	if (toolName === "SendMessage") {
+		const text = nonEmpty(message);
+		return text && typeof to === "string" ? `To ${to}: ${text}` : text;
+	}
+	if (toolName === "AskUserQuestion" && Array.isArray(questions)) {
+		return nonEmpty(questions.map(questionText).join("\n\n"));
+	}
+	return null;
+}
+
+function questionText(question: unknown): string {
+	if (typeof question !== "object" || question === null) {
+		return "";
+	}
+	const { question: asked, options } = question as Record<string, unknown>;
+	const labels = (Array.isArray(options) ? options : [])
+		.map((option) => (option as { label?: unknown } | null)?.label)
+		.filter((label): label is string => typeof label === "string");
+	return [nonEmpty(asked) ?? "", ...labels.map((label) => `- ${label}`)]
+		.join("\n")
+		.trim();
+}
+
+function nonEmpty(text: unknown): string | null {
+	return typeof text === "string" && text.trim() !== "" ? text.trim() : null;
 }
 
 function userEvents(
@@ -376,8 +504,8 @@ function contentBlocks(content: unknown): ContentBlock[] {
 async function snapshotSessions(
 	directory: string,
 	sessions: SessionRecord[],
-): Promise<SessionSnapshot[]> {
-	const live = await readLiveSessions(directory);
+): Promise<SnapshotRead> {
+	const { live, warnings } = await readLiveSessions(directory);
 	const branches = new Map<string, Promise<string | null>>();
 	const branchOf = (cwd: string) => {
 		const branch = branches.get(cwd) ?? currentBranch(cwd);
@@ -412,33 +540,47 @@ async function snapshotSessions(
 			};
 		}),
 	);
-	return snapshots.filter((snapshot) => snapshot !== null);
+	return {
+		snapshots: snapshots.filter((snapshot) => snapshot !== null),
+		warnings,
+	};
 }
 
 async function readLiveSessions(
 	directory: string,
-): Promise<Map<string, LiveState>> {
+): Promise<{ live: Map<string, LiveState>; warnings: string[] }> {
 	const live = new Map<string, LiveState>();
 	if (!(await isDirectory(directory))) {
-		return live;
+		return { live, warnings: [] };
 	}
+	const candidates: SessionFile[] = [];
 	for await (const name of new Glob("*.json").scan({ cwd: directory })) {
 		const record = await readSessionFile(join(directory, name));
 		if (
-			!record ||
-			!LIVE_KINDS.has(record.kind) ||
-			isScripted(record.entrypoint) ||
-			record.parkedJobId !== undefined ||
-			!isAlive(record.pid)
+			record &&
+			LIVE_KINDS.has(record.kind) &&
+			!isScripted(record.entrypoint) &&
+			record.parkedJobId === undefined
 		) {
+			candidates.push(record);
+		}
+	}
+	const processes = await processStarts(candidates.map(({ pid }) => pid));
+	for (const record of candidates) {
+		if (!isSessionProcess(record, processes)) {
 			continue;
 		}
-		const state = BUSY_STATUSES.has(record.status ?? "") ? "busy" : "idle";
-		if (live.get(record.sessionId) !== "busy") {
+		const state = liveState(record.status);
+		const stored = live.get(record.sessionId);
+		if (!stored || STATE_PRIORITY[state] > STATE_PRIORITY[stored]) {
 			live.set(record.sessionId, state);
 		}
 	}
-	return live;
+	if (!("failure" in processes)) {
+		return { live, warnings: [] };
+	}
+	const warning = `couldn't match Claude pids to their start times, so a reused pid can look live: ${processes.failure}`;
+	return { live, warnings: [warning] };
 }
 
 async function readSessionFile(path: string): Promise<SessionFile | null> {
@@ -452,6 +594,78 @@ async function readSessionFile(path: string): Promise<SessionFile | null> {
 	} catch {
 		return null;
 	}
+}
+
+async function processStarts(pids: number[]): Promise<ProcessStarts> {
+	const starts = new Map<number, number | null>();
+	if (pids.length === 0) {
+		return { starts };
+	}
+	try {
+		const result = await Bun.$`ps -o pid=,lstart= -p ${pids.join(",")}`
+			.env({ ...process.env, LC_ALL: "C", TZ: "UTC" })
+			.nothrow()
+			.quiet();
+		const output = result.stdout.toString();
+		const errors = result.stderr.toString().trim();
+		// fact: ps exits 1 with no output and no error when none of the pids is running.
+		const noneRunning =
+			result.exitCode === 1 && output.trim() === "" && errors === "";
+		if (result.exitCode !== 0 && !noneRunning) {
+			return { failure: `ps exited ${result.exitCode}: ${errors}` };
+		}
+		for (const line of output.split("\n")) {
+			const match = PS_LINE.exec(line);
+			if (match) {
+				starts.set(Number(match[1]), parseProcessStart(match[2]));
+			}
+		}
+		return { starts };
+	} catch (error) {
+		return { failure: error instanceof Error ? error.message : String(error) };
+	}
+}
+
+function isSessionProcess(
+	record: SessionFile,
+	processes: ProcessStarts,
+): boolean {
+	if ("failure" in processes) {
+		return isAlive(record.pid);
+	}
+	const started = processes.starts.get(record.pid);
+	if (started === undefined) {
+		return false;
+	}
+	const recorded = parseProcessStart(record.procStart);
+	return started === null || recorded === null || recorded === started;
+}
+
+function parseProcessStart(text: unknown): number | null {
+	const match = typeof text === "string" ? CTIME.exec(text.trim()) : null;
+	if (!match) {
+		return null;
+	}
+	const [, month, day, hours, minutes, seconds, year] = match;
+	const monthIndex = MONTHS.indexOf(month ?? "");
+	if (monthIndex === -1) {
+		return null;
+	}
+	return Date.UTC(
+		Number(year),
+		monthIndex,
+		Number(day),
+		Number(hours),
+		Number(minutes),
+		Number(seconds),
+	);
+}
+
+function liveState(status: string | undefined): LiveState {
+	if (status === "waiting") {
+		return "waiting";
+	}
+	return BUSY_STATUSES.has(status ?? "") ? "busy" : "idle";
 }
 
 function isAlive(pid: number): boolean {
@@ -513,6 +727,7 @@ type TranscriptEntry = {
 	aiTitle?: unknown;
 	agentName?: unknown;
 	customTitle?: unknown;
+	continuedInSessionId?: unknown;
 	isMeta?: boolean;
 	isCompactSummary?: boolean;
 	isVisibleInTranscriptOnly?: boolean;
@@ -547,11 +762,20 @@ type SessionFile = {
 	entrypoint?: string;
 	status?: string;
 	parkedJobId?: string;
+	procStart?: unknown;
 };
+
+type ProcessStarts =
+	| { starts: Map<number, number | null> }
+	| { failure: string };
 
 type LiveState = Exclude<SessionState, "ended">;
 
 const TRANSCRIPT_PATTERNS = ["*/*.jsonl", "*/*/subagents/**/agent-*.jsonl"];
+
+const CONTINUATION_TAIL_BYTES = 64 * 1024;
+
+const CONTINUED_IN_MARKER = '"continued-in"';
 
 const SDK_PREFIX = "sdk-";
 
@@ -581,5 +805,32 @@ const INJECTED_USER_TEXT =
 const LIVE_KINDS = new Set(["interactive", "bg"]);
 
 const BUSY_STATUSES = new Set(["busy", "shell"]);
+
+const STATE_PRIORITY: Record<LiveState, number> = {
+	idle: 0,
+	busy: 1,
+	waiting: 2,
+};
+
+const PS_LINE = /^\s*(\d+)\s+(.+?)\s*$/;
+
+// fact: Claude writes procStart, and `ps -o lstart=` under LC_ALL=C prints, a ctime string such as "Fri Oct  3 16:23:39 2026"; procStart is in UTC.
+const CTIME =
+	/^[A-Z][a-z]{2} ([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
+
+const MONTHS = [
+	"Jan",
+	"Feb",
+	"Mar",
+	"Apr",
+	"May",
+	"Jun",
+	"Jul",
+	"Aug",
+	"Sep",
+	"Oct",
+	"Nov",
+	"Dec",
+];
 
 const SUBAGENT_QUIET_MS = 2 * 60_000;

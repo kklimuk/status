@@ -19,6 +19,7 @@
 - **Return `null` when there's nothing to ingest:** a skipped source (Claude `entrypoint: sdk-cli`, Codex `thread_source: guardian_review`), or one without a complete first line yet. Sync stores nothing for it, so it's checked again on the next run.
 - **A file shorter than `readOffset` was rewritten.** Read it again from 0; stable keys make that safe.
 - **`warnings` names anything the read had to do without,** such as titles when Codex's `state_5.sqlite` can't be read. The read carries on, and sync reports the warning instead of staying silent.
+- **`continuedIn` names the session that replaces this one,** when the harness moved its work into a new session that starts with a copy of this one's history. Sync then drops this session and moves its subagents under the continuation, and ignores `events` and `nextOffset`. An adapter whose harness never does this leaves it unset.
 
 ## Events
 
@@ -30,6 +31,7 @@
 ## `snapshot(sessions)`
 
 - **Returns the live sessions among those it's given, subagents included,** each `busy`, `idle` or `waiting` with its live `cwd` and `branch`. `waiting` means blocked on the user: a permission prompt or a question the harness itself is holding open. Sync marks every session the snapshot leaves out `ended`.
+- **`warnings` names anything the snapshot had to do without,** such as a liveness check that couldn't run. The snapshot still returns its best answer, and sync reports the warnings.
 - **Snapshots observe the real present** (live pids, file modification times), so adapters use the real clock, not `app.now()`.
 
 ## Surface
@@ -52,7 +54,18 @@ Checked against `~/.claude` on 2026-10-23 (Claude Code 2.1.309): 28 root transcr
 - **`title` is the latest `custom-title`, `agent-name` or `ai-title` line,** whichever came last. A subagent has none of these; its title is `description` from its `agent-<id>.meta.json`.
 - **`branch` is the latest `gitBranch`;** `HEAD` (a detached checkout) is stored as `null`, as `git branch --show-current` reports it.
 - **A subagent's `parentId` is the root session,** even for a nested agent (`spawnDepth: 2`). Its meta's `parentAgentId` names the agent that spawned it, and isn't used yet.
-- **A background job continued from an interactive session is a separate root session.** The old transcript ends with a `continued-in` line naming the job, and the job's transcript starts with a copy of the old one's history.
+- **A subagent's parent follows continuations,** below: an agent under `<old>/subagents/` belongs to the session that replaced `<old>`.
+
+### Continued sessions
+
+- **When an interactive session moves into a background job, the job replaces it.** Claude Code creates a new session for the job, copies every entry of the old transcript into it (same `uuid`s, the new `sessionId`), appends `{"type":"continued-in","sessionId":<old>,"continuedInSessionId":<new>}` to the old transcript, and symlinks some of the old session's subagent files into the job's `subagents/` (only the one still running, in the one real case: 1 of 2).
+- **A root read checks the last 64 KiB of its transcript for a `continued-in` line,** whatever `readOffset` says, so a session stored before the line was appended is caught too. It follows the chain (a job continued again) through sibling `<id>.jsonl` files and returns the last one as `continuedIn`, without parsing events.
+- **A continuation counts only once its transcript can be ingested:** it exists, has a complete `uuid` line, and isn't `sdk-*`. Nothing is dropped before what replaces it is stored.
+- **The marker counts anywhere in the last 64 KiB,** even with entries after it. In the one real case it's the last line. If a parked session were written to again, its new lines would be dropped while the marker stays in the tail. Unverified, because none has been.
+- **A chain that loops back to a transcript already on it replaces nothing,** so two sessions that name each other are both kept rather than both dropped.
+- **A subagent's `parentId` resolves through the same chain** from its root transcript, `projects/*/<sessionId>.jsonl`, so a re-read never moves it back under the dropped session.
+- **Out-of-window limit:** the old transcript is only re-read while `listSources` lists it. Appending `continued-in` bumps its modification time, so this only misses when `status` doesn't run for the whole window after the continuation.
+- **`claude --resume <id> --fork-session` is not deduped.** A fork copies every entry with its `uuid`, re-stamped with the new `sessionId` (12 of 12 in a probe), and writes no marker in either file. Both halves go on independently, so the copied prefix shows up in both sessions.
 
 ### Events
 
@@ -62,6 +75,11 @@ Checked against `~/.claude` on 2026-10-23 (Claude Code 2.1.309): 28 root transcr
   - `auto_denied`: `Permission for this action was denied by the Claude Code auto mode classifier` (followed by "Reason: …") or `Permission for this command was denied by a built-in Claude Code safety check` (followed by "not by the user", for removals that could delete far more than intended). Both appear in real transcripts.
   - The text must start with the marker, so a failed command whose output quotes one stays `error`.
 - **The tool target is the first of `file_path`, `notebook_path`, `command`, `url` and `pattern`;** the headline is the tool name and the target's first line.
+- **Three tools carry the agent's own words, so each call also becomes an assistant `message`,** keyed `<tool_use id>:spoken`, right after its `tool_call`:
+  - `SubagentHandback`: `message` is a subagent's final report to its parent. Many subagents report only this way, with no assistant text at all.
+  - `SendMessage`: `message` to `to` (a subagent, `main` or a peer session), stored as `To <to>: <message>`.
+  - `AskUserQuestion`: each of `questions` as its `question` followed by its options' `label`s, one `- <label>` per line. The answer arrives as a tool result and isn't kept.
+  - Empty text adds no message. Every other tool's input is instructions to a tool, not speech: `StructuredOutput` is a scripted agent's typed result, and `Agent`'s `prompt` is already the subagent's first user message.
 - **A user line is the user's words only when** it has no `isMeta`, `isCompactSummary` or `isVisibleInTranscriptOnly`, and its `origin` is absent or `kind: human`. That skips skill bodies, system reminders, compaction summaries, peer and coordinator messages, and task notifications.
 - **Within those, text that starts with an injected tag is skipped:** `<command-*>` (slash-command wrappers), `<local-command-*>`, `<bash-*>` (`!` shell input and output), `<ide_*>`, `<browser_instruction>`, `<system-reminder>`, `<task-notification>`, and a bare `[Request interrupted by user]`. Two are kept on purpose:
   - `<pasted_content>`, because it's what the user pasted;
@@ -72,11 +90,16 @@ Checked against `~/.claude` on 2026-10-23 (Claude Code 2.1.309): 28 root transcr
 
 ### Snapshot
 
-- **`sessions/<pid>.json` counts when its pid is alive, its `kind` is `interactive` or `bg`, its `entrypoint` isn't `sdk-*`, and it has no `parkedJobId`.** `claude -p` writes `kind: interactive` too, so `kind` alone doesn't tell a scripted run apart. `daemon` and `daemon-worker` are Claude's own processes. `parkedJobId` marks an interactive session moved into a background job: its process stays open, but the work goes on in the job's session.
-- **`sessions/` is read once per snapshot,** and `git` runs only for live sessions, once per directory.
-- **`status` maps `busy` and `shell` to `busy`, and `idle` and `waiting` to `idle`.** Claude's UI shows `busy` and `shell` as working and `waiting` (a permission prompt or dialog) as blocked. A torn or unreadable file, or one without a positive integer `pid`, is skipped: `kill(0, 0)` signals the caller's own process group and would always look alive.
+- **`sessions/<pid>.json` counts when its pid is this session's process, its `kind` is `interactive` or `bg`, its `entrypoint` isn't `sdk-*`, and it has no `parkedJobId`.** `claude -p` writes `kind: interactive` too, so `kind` alone doesn't tell a scripted run apart. `daemon` and `daemon-worker` are Claude's own processes. `parkedJobId` marks an interactive session moved into a background job: its process stays open, but the work goes on in the job's session.
+- **`sessions/` is read once per snapshot,** one `ps` runs for every candidate pid, and `git` runs only for live sessions, once per directory.
+- **A pid is the session's only when its process started when the pid file says.** A stale file can name a pid the OS has given to an unrelated process. `procStart` is a ctime string in UTC ("Fri Oct 23 16:23:39 2026"), and `ps -o pid=,lstart= -p <pids>` prints the same format, so it runs with `LC_ALL=C` and `TZ=UTC` and the two must agree to the second. Claude Code checks its own holders the same way.
+  - A pid `ps` doesn't list is dead. `ps` exits 1 with no output when none of the pids is running, which isn't a failure.
+  - A file without a parseable `procStart` counts when `ps` lists its pid, and so does a listed pid whose `lstart` doesn't parse.
+  - **When `ps` itself fails,** each pid falls back to `kill(pid, 0)` (alive, or `EPERM`) and the snapshot warns that a reused pid can look live, rather than marking every session ended.
+- **`status` maps `busy` and `shell` to `busy`, `waiting` to `waiting`, and `idle` to `idle`.** These four are every value Claude Code 2.1.310 writes. It writes `waiting` while anything holds the session for the user, and names it in `waitingFor`: a permission prompt or other dialog (`dialog open`), a question or elicitation (`input needed`), `sandbox request`, `worker request` or `goal proposal`. When two live pid files name one session, `waiting` beats `busy`, which beats `idle`. A torn or unreadable file, or one without a positive integer `pid`, is skipped: `kill(0, 0)` signals the caller's own process group and would always look alive.
 - **A live session's `cwd` is its transcript's latest `cwd`, and its branch comes from `git -C <cwd> branch --show-current`.** The pid file's `cwd` is where the session started and never moves; one transcript here passes through 31 directories as the session moves between worktrees.
-- **A subagent is `busy` while its parent's pid file is live (busy or idle), its meta isn't `finished: true`, and its transcript changed in the last 2 minutes.** A background subagent keeps working while its parent sits idle, so a busy parent isn't required. A subagent quiet for over 2 minutes (a long test run, say) shows as ended until it writes again.
+- **A subagent is `busy` while its parent's pid file is live (in any state), its meta isn't `finished: true`, and its transcript changed in the last 2 minutes.** A background subagent keeps working while its parent sits idle, so a busy parent isn't required. A subagent quiet for over 2 minutes (a long test run, say) shows as ended until it writes again.
+  - **A subagent never shows `waiting`.** Its permission prompts surface in the parent's UI, so the parent's pid file says `waiting`, and the subagent stays `busy` for its 2 minutes. Nothing in the pid file says whose prompt it is. Real subagent rejections came 0 to 16 seconds after the call, so the cutoff rarely bites.
 
 ## Codex
 
