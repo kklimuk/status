@@ -11,6 +11,7 @@ export function createTestApp(overrides: Partial<App> = {}): App {
 	return {
 		...app,
 		progress: () => {},
+		outputColumns: null,
 		askClaude: rejectUnexpectedCall,
 		...overrides,
 	};

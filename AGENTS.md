@@ -1,6 +1,6 @@
 # status
 
-`status` reads local Claude Code and Codex session transcripts, normalizes them into `~/.status/status.db`, and reports what each session is doing: finished, blocked on the user, or still running. People run `status` for a morning triage. Agents run `status summaries` to see what other sessions are already doing before they act.
+`status` reads local Claude Code and Codex session transcripts, normalizes them into `~/.status/status.db`, and reports what each session is doing: finished, blocked on the user, or still running. People run `status list` for a morning triage, or `status get "<question>"` for one answer. Agents run `status summaries list` to see what other sessions are already doing before they act.
 
 ## Stack and commands
 
@@ -21,19 +21,21 @@
   - `paths`, from `STATUS_HOME`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` (defaults `~/.status`, or `<worktree>/.status` in a linked worktree, then `~/.claude` and `~/.codex`);
   - the harness adapters;
   - `now()`;
-  - `progress`, which writes a line to stderr only when stderr is a terminal;
+  - `progress(tag, message)`, which writes a timestamped, tagged log line (`2026-10-24T10:42:07-07:00 [sync] …`) to stderr only when stderr is a terminal, so an agent or a pipe gets no log (`src/cli/AGENTS.md`);
+  - `outputColumns`, stdout's width when stdout is a terminal and `null` when it's piped, so a command can fit a table to the screen and give a program everything;
   - `askClaude`.
 
   `createApp(environment)` builds it and opens `<status>/status.db`.
 - **`src/harnesses/` owns the session contract** and one adapter per harness (`src/harnesses/AGENTS.md`).
 - **`src/sync/` pulls what the adapters read into `sessions` and `events`** and owns every write to them (`src/sync/AGENTS.md`).
-- **`src/summaries/` keeps one rolling Haiku summary per session,** subagents included, each subagent's feeding its parent's, and owns every read and write of `summaries`, except that sync deletes the summary of a session it drops as continued (`src/summaries/AGENTS.md`).
+- **`src/summaries/` keeps one rolling Haiku summary per session,** subagents included, each subagent's feeding its parent's, and owns every read and write of `summaries`, except that sync deletes the summary of a session it drops as continued. It also reads the catalog that `status summaries` shows (`src/summaries/AGENTS.md`).
+- **`src/statuses/` turns sessions and summaries into what the `status` commands show:** the roots in the window, the Opus brief by goal and the answer to a question, as plain data the CLI lays out (`src/statuses/AGENTS.md`).
 - **`src/database.ts` owns the schema,** and `drizzle/` holds its generated migrations.
-- **`src/utils.ts` holds `askClaude`,** the `claude -p` runner.
+- **`src/utils.ts` holds `askClaude`,** the `claude -p` runner, and the helpers every feature shares: `colorize` with its tones (`STATE_TONES` for session states), `formatDuration`, `pluralize` and `describeError`.
 - **`src/cli/` parses arguments and runs the commands** (`src/cli/AGENTS.md`).
 - **`tests/` shadows `src/`:** the tests for `src/harnesses/claude.ts` live in `tests/harnesses/claude.test.ts`. Shared test helpers live in `tests/utils.ts`, imported as `@tests/utils`. Call them inside a test or a `beforeEach`, because they clean up with `onTestFinished`:
   - `createTemporaryHome()` makes empty `.status`, `.claude` and `.codex` directories, and returns their paths plus an `environment` that points `createApp` or a spawned CLI at them.
-  - `createTestApp(overrides)` builds a real `App` on a temporary home, with a silent `progress` and an `askClaude` that rejects. Pass your own fake `askClaude`, `now` or `adapters` as overrides.
+  - `createTestApp(overrides)` builds a real `App` on a temporary home, with a silent `progress`, `outputColumns: null` (piped) and an `askClaude` that rejects. Pass your own fake `askClaude`, `now` or `adapters` as overrides.
 - **Tests never read the real `~/.claude`, `~/.codex` or `~/.status`.** Build fixtures in a temporary directory.
 
 ## Database
@@ -67,7 +69,7 @@
 - **Tests never call the real CLI:**
   - Give `createTestApp` a fake `askClaude`.
   - Test `askClaude` itself against a fake executable, passed as its second argument. Bun resolves executables from the `PATH` the process started with, so prepending a fake to `process.env.PATH` silently runs the real `claude`.
-  - A test that spawns `src/index.ts` sticks to `--help` and argument errors, because a real command run would call the real CLI.
+  - A test that spawns `src/index.ts` sticks to `--help`, argument errors and runs on an empty temporary home, because a real command run with sessions to summarize would call the real CLI.
 
 ## Worktrees
 
@@ -97,7 +99,7 @@ The rules below are the _how_; these are the _why_. When a rule and a situation 
 
 ## Rules
 
-- **Group code logically.** Keep a type next to the code that uses it, and keep a feature's accessors and logic together in its `index.ts`. Add a sibling file only for a unit with its own meaning (`harnesses/claude.ts`, `harnesses/codex.ts`), never one per helper or type.
+- **Group code logically.** Keep a type next to the code that uses it, and keep a feature's accessors and logic together with it. A small feature can live in its `index.ts`. A larger one splits into sibling files that each have their own meaning (`harnesses/claude.ts`, `summaries/refresh.ts`, `statuses/brief.ts`), and its `index.ts` becomes only the door. Never add a file per helper or type.
 - **Shared helpers have one home each.** Helpers used across features live in `src/utils.ts`. Helpers shared within one feature live in `<feature>/utils.ts`. Everything else stays in the file that uses it.
 - **Functions first, types and constants last.** A file opens with the functions that do its work: exported functions first, then the helpers they call, in the order they're called, written as hoisted `function` declarations so reading down shows the structure. Types and constants go at the bottom, exported ones included. A file that only declares types (the contract in `src/harnesses/index.ts`) leads with its main type.
 - **Name every database read.** Logic calls a selector whose name says what it returns (`summariesBySession(database)`, `newestEventIdBySession(database)`, `childrenOf(database, sessionId)`) instead of building a query inline. Selectors are small functions below the logic that uses them, in the feature that uses them, and they return plain rows or maps. When a second feature needs the same selector, it moves to the table's owner.
@@ -108,7 +110,7 @@ The rules below are the _how_; these are the _why_. When a rule and a situation 
 - **Console calls are default-deny in `src/` and `tests/`.** Biome enforces this. Commands return the text to print, and `src/index.ts` writes it, in color only to a terminal (`src/cli/AGENTS.md`). Progress on a slow step goes through `app.progress`. Scripts and probes written for a human may print to the terminal.
 - **Prefer early returns** when they make the branches easier to follow.
 - **Ternaries are one-line and two-armed.** Don't nest them. Use `if` or early returns once they wrap or branch again.
-- **File names are kebab-case.** A command's file is named after the command, inside a folder for its group when the group has several (`commands/summaries.ts` for `status summaries`). Any other file is named after its primary export or its subject (`claude.ts`).
+- **File names are kebab-case.** A noun's verbs share one file named after the noun (`commands/summaries.ts` for `status summaries list` and `status summaries get`). Any other file is named after its primary export or its subject (`claude.ts`).
 - **Every feature has one public door, its `index.ts`.** External callers import through it (`@src/harnesses`, not `@src/harnesses/claude`). The door re-exports its sibling files with `export * from`. To expose more, export it from the sibling; never reach into an internal file. `src/cli` is the top layer: only `src/index.ts` and tests import it.
 - **Use function declarations** for exported functions and helpers. Arrows are for inline callbacks, short utilities, and values checked against a named function type.
 - **Style:** tabs and double quotes, enforced by Biome.

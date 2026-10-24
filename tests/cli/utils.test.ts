@@ -8,7 +8,12 @@ test("a refresh with nothing to read reports no issues", async () => {
 
 	const refreshed = await refresh(app, 7);
 
-	expect(refreshed).toEqual({ deferred: new Set(), failed: false, issues: "" });
+	expect(refreshed).toEqual({
+		deferred: new Set(),
+		haiku: { calls: 0, inputTokens: 0 },
+		failed: false,
+		issues: "",
+	});
 });
 
 test("a refresh whose adapter can't list its sources fails and says why", async () => {

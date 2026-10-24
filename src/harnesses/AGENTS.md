@@ -53,8 +53,14 @@ Checked against `~/.claude` on 2026-10-23 (Claude Code 2.1.309): 28 root transcr
 
 - **`title` is the latest `custom-title`, `agent-name` or `ai-title` line,** whichever came last. A subagent has none of these; its title is `description` from its `agent-<id>.meta.json`.
 - **`branch` is the latest `gitBranch`;** `HEAD` (a detached checkout) is stored as `null`, as `git branch --show-current` reports it.
-- **A subagent's `parentId` is the root session,** even for a nested agent (`spawnDepth: 2`). Its meta's `parentAgentId` names the agent that spawned it, and isn't used yet.
-- **A subagent's parent follows continuations,** below: an agent under `<old>/subagents/` belongs to the session that replaced `<old>`.
+- **A nested subagent's `parentId` is the agent that spawned it:** `parentAgentId` in its meta, when `agent-<parentAgentId>.jsonl` sits beside its transcript. Any other subagent's parent is the root session.
+  - Checked on 2026-10-24 against 1,236 subagent transcripts (Claude Code 2.1.281 to 2.1.309). The 81 with `spawnDepth: 2` all have `parentAgentId`, the 1,155 with `spawnDepth: 1` none, and there's no deeper level. Every named agent's transcript was beside the child's.
+  - Each one matches the tool result in the spawner's own transcript, whose `toolUseResult.agentId` is the child: 206 of the 207 agents outside workflows, 0 against. They cover `Agent` calls (foreground and `run_in_background`, `general-purpose` and `Explore`) and `Skill` calls of a forked skill such as `code-review`, from the root and from a subagent. The one without a tool result is a root's forked skill.
+  - **Workflow agents** (1,029) are all `spawnDepth: 1` without `parentAgentId`, and every `Workflow` call came from a root, so a subagent's workflow is unverified. No `Agent` call here used `subagent_type: "fork"`.
+  - **A resumed agent keeps its id, transcript and meta:** a `SendMessage` to a finished agent returns `resumedAgentId` (and `revivedAgentId`, the same id), so its parent stays the agent that spawned it.
+  - Without a meta, without `parentAgentId`, with one naming the agent itself (a session that's its own parent would loop every walk up `parent_id`), or with no transcript beside it under that name, the parent is the root.
+  - **A stored parent moves on the next read:** every listed source is re-read and its parent overwritten, so a database stored while every subagent pointed at the root catches up. A subagent whose transcript is older than the window keeps the root until a wider run lists it.
+- **The root follows continuations,** below: an agent under `<old>/subagents/` belongs to the session that replaced `<old>`.
 
 ### Continued sessions
 
@@ -63,7 +69,7 @@ Checked against `~/.claude` on 2026-10-23 (Claude Code 2.1.309): 28 root transcr
 - **A continuation counts only once its transcript can be ingested:** it exists, has a complete `uuid` line, and isn't `sdk-*`. Nothing is dropped before what replaces it is stored.
 - **The marker counts anywhere in the last 64 KiB,** even with entries after it. In the one real case it's the last line. If a parked session were written to again, its new lines would be dropped while the marker stays in the tail. Unverified, because none has been.
 - **A chain that loops back to a transcript already on it replaces nothing,** so two sessions that name each other are both kept rather than both dropped.
-- **A subagent's `parentId` resolves through the same chain** from its root transcript, `projects/*/<sessionId>.jsonl`, so a re-read never moves it back under the dropped session.
+- **A subagent's root resolves through the same chain** from its root transcript, `projects/*/<sessionId>.jsonl`, so a re-read never moves it back under the dropped session.
 - **Out-of-window limit:** the old transcript is only re-read while `listSources` lists it. Appending `continued-in` bumps its modification time, so this only misses when `status` doesn't run for the whole window after the continuation.
 - **`claude --resume <id> --fork-session` is not deduped.** A fork copies every entry with its `uuid`, re-stamped with the new `sessionId` (12 of 12 in a probe), and writes no marker in either file. Both halves go on independently, so the copied prefix shows up in both sessions.
 
@@ -98,8 +104,13 @@ Checked against `~/.claude` on 2026-10-23 (Claude Code 2.1.309): 28 root transcr
   - **When `ps` itself fails,** each pid falls back to `kill(pid, 0)` (alive, or `EPERM`) and the snapshot warns that a reused pid can look live, rather than marking every session ended.
 - **`status` maps `busy` and `shell` to `busy`, `waiting` to `waiting`, and `idle` to `idle`.** These four are every value Claude Code 2.1.310 writes. It writes `waiting` while anything holds the session for the user, and names it in `waitingFor`: a permission prompt or other dialog (`dialog open`), a question or elicitation (`input needed`), `sandbox request`, `worker request` or `goal proposal`. When two live pid files name one session, `waiting` beats `busy`, which beats `idle`. A torn or unreadable file, or one without a positive integer `pid`, is skipped: `kill(0, 0)` signals the caller's own process group and would always look alive.
 - **A live session's `cwd` is its transcript's latest `cwd`, and its branch comes from `git -C <cwd> branch --show-current`.** The pid file's `cwd` is where the session started and never moves; one transcript here passes through 31 directories as the session moves between worktrees.
-- **A subagent is `busy` while its parent's pid file is live (in any state), its meta isn't `finished: true`, and its transcript changed in the last 2 minutes.** A background subagent keeps working while its parent sits idle, so a busy parent isn't required. A subagent quiet for over 2 minutes (a long test run, say) shows as ended until it writes again.
+- **A subagent is `busy` while its root session's pid file is live (in any state), its meta isn't `finished: true`, and its transcript changed in the last 2 minutes.** A background subagent keeps working while its parent sits idle, so a busy parent isn't required. Only roots have pid files, and a nested subagent's `parentId` is an agent, so every subagent's root comes from its transcript's head and path, through continuations, not from `parentId`. A subagent quiet for over 2 minutes (a long test run, say) shows as ended until it writes again.
   - **A subagent never shows `waiting`.** Its permission prompts surface in the parent's UI, so the parent's pid file says `waiting`, and the subagent stays `busy` for its 2 minutes. Nothing in the pid file says whose prompt it is. Real subagent rejections came 0 to 16 seconds after the call, so the cutoff rarely bites.
+
+### Self-identification
+
+- **`claudeSessionAbove(home, pid)` finds the Claude session running a process,** so `status summaries list` can leave out its caller. It walks up from `pid`, one `ps -o ppid=,lstart=` per hop (with `LC_ALL=C` and `TZ=UTC`, at most 64 hops), until `sessions/<pid>.json` names that pid and its `procStart` matches the process's start, as the snapshot matches them: a `procStart` or an `lstart` that doesn't parse counts as a match. That's the Claude process, so under a subagent the walk finds the root session, not the subagent: a stream agent sees its sibling streams, and itself as one of its root's subagents.
+- **A pid that `ps` doesn't list ends the walk** with no session. `ps` itself failing throws, so the caller can warn that it may be listed.
 
 ## Codex
 
@@ -155,4 +166,4 @@ Checked against 306 rollouts from Codex CLI 0.150 to 0.164, on 2026-10-23.
 
 ### Self-identification
 
-- Commands Codex runs get `CODEX_THREAD_ID=<threadId>` (and `CODEX_SESSION_ID`, the same value for a root thread) in their environment, so `status summaries` can leave out `codex:$CODEX_THREAD_ID`.
+- Commands Codex runs get `CODEX_THREAD_ID=<threadId>` (and `CODEX_SESSION_ID`, the same value for a root thread) in their environment; the name sits among the exec environment variables in the 0.163 binary. It names the exact thread, subagent or root, so `codexSessionIn(environment)` returns `codex:$CODEX_THREAD_ID` and `status summaries` can leave it out.

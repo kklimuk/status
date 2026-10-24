@@ -1,5 +1,9 @@
 import { expect, test } from "bun:test";
-import { createClaudeAdapter, type SessionRecord } from "@src/harnesses";
+import {
+	claudeSessionAbove,
+	createClaudeAdapter,
+	type SessionRecord,
+} from "@src/harnesses";
 import { createTemporaryHome } from "@tests/utils";
 import { mkdirSync, symlinkSync, utimesSync } from "fs";
 import { appendFile } from "fs/promises";
@@ -97,21 +101,7 @@ test("a detached HEAD is recorded as no branch", async () => {
 
 test("a subagent is its own session, titled by its description and linked to its parent", async () => {
 	const { claude } = createTemporaryHome();
-	const path = join(
-		claude,
-		"projects",
-		"-work-repo",
-		SESSION_ID,
-		"subagents",
-		"agent-a1.jsonl",
-	);
-	await writeLines(path, [
-		userLine({ text: "review the diff", agentId: "a1", isSidechain: true }),
-	]);
-	await Bun.write(
-		path.replace(/\.jsonl$/, ".meta.json"),
-		JSON.stringify({ agentType: "general-purpose", description: "Review" }),
-	);
+	const path = await writeSubagent(claude, "a1", { description: "Review" });
 
 	const read = await createClaudeAdapter(claude).readSource(path, null);
 
@@ -119,8 +109,41 @@ test("a subagent is its own session, titled by its description and linked to its
 	expect(read?.session.parentId).toBe(`claude:${SESSION_ID}`);
 	expect(read?.session.title).toBe("Review");
 	expect(read?.events).toMatchObject([
-		{ kind: "message", role: "user", text: "review the diff" },
+		{ kind: "message", role: "user", text: "task" },
 	]);
+});
+
+test("a nested subagent's parent is the agent that spawned it", async () => {
+	const { claude } = createTemporaryHome();
+	await writeSubagent(claude, "a1", { spawnDepth: 1 });
+	const nested = await writeSubagent(claude, "a2", {
+		parentAgentId: "a1",
+		spawnDepth: 2,
+	});
+
+	const read = await createClaudeAdapter(claude).readSource(nested, null);
+
+	expect(read?.session.parentId).toBe("claude:a1");
+});
+
+test("a subagent whose spawning agent has no transcript beside it, or is itself, belongs to the root", async () => {
+	const { claude } = createTemporaryHome();
+	const adapter = createClaudeAdapter(claude);
+	const orphaned = await writeSubagent(claude, "a2", {
+		parentAgentId: "gone",
+		spawnDepth: 2,
+	});
+	const selfNamed = await writeSubagent(claude, "a3", {
+		parentAgentId: "a3",
+		spawnDepth: 2,
+	});
+
+	expect((await adapter.readSource(orphaned, null))?.session.parentId).toBe(
+		`claude:${SESSION_ID}`,
+	);
+	expect((await adapter.readSource(selfNamed, null))?.session.parentId).toBe(
+		`claude:${SESSION_ID}`,
+	);
 });
 
 test("scripted claude -p transcripts are skipped", async () => {
@@ -518,23 +541,24 @@ test("snapshot reports live root sessions with their state, directory and branch
 	expect(warnings).toEqual([]);
 });
 
-test("a subagent is busy while its parent is live and its transcript changed in the last 2 minutes", async () => {
+test("a subagent is busy while its root session is live and its transcript changed in the last 2 minutes", async () => {
 	const { claude, codex } = createTemporaryHome();
 	const repo = await createRepository(codex, "stream");
 	await writeSessionFile(claude, 1, { sessionId: "parent", status: "idle" });
 	const subagent = async (
 		name: string,
-		options: { modified?: Date; finished?: boolean } = {},
+		options: { root?: string; modified?: Date; finished?: boolean } = {},
 	) => {
+		const root = options.root ?? "parent";
 		const path = join(
 			claude,
 			"projects",
 			"-repo",
-			"parent",
+			root,
 			"subagents",
 			`agent-${name}.jsonl`,
 		);
-		await writeLines(path, [userLine({ text: "task" })]);
+		await writeLines(path, [userLine({ text: "task", sessionId: root })]);
 		if (options.modified) {
 			setModified(path, options.modified);
 		}
@@ -546,7 +570,7 @@ test("a subagent is busy while its parent is live and its transcript changed in 
 		}
 		return record({
 			id: `claude:${name}`,
-			parentId: "claude:parent",
+			parentId: `claude:${root}`,
 			cwd: repo,
 			sourcePath: path,
 		});
@@ -555,17 +579,15 @@ test("a subagent is busy while its parent is live and its transcript changed in 
 		await subagent("running"),
 		await subagent("quiet", { modified: new Date(Date.now() - 3 * 60_000) }),
 		await subagent("finished", { finished: true }),
-		record({
-			id: "claude:orphan",
-			parentId: "claude:ended-parent",
-			sourcePath: "/nowhere.jsonl",
-		}),
+		{ ...(await subagent("nested")), parentId: "claude:finished" },
+		await subagent("orphan", { root: "ended-parent" }),
 	];
 
 	const { snapshots } = await createClaudeAdapter(claude).snapshot(sessions);
 
 	expect(snapshots).toEqual([
 		{ sessionId: "claude:running", state: "busy", cwd: repo, branch: "stream" },
+		{ sessionId: "claude:nested", state: "busy", cwd: repo, branch: "stream" },
 	]);
 });
 
@@ -634,6 +656,34 @@ test("without ps, a live pid still counts and the snapshot warns", async () => {
 	expect(read.warnings[0]).toStartWith(
 		"couldn't match Claude pids to their start times",
 	);
+});
+
+test("the Claude session above a process is the nearest one up its parents whose pid file matches that process's start", async () => {
+	const { claude } = createTemporaryHome();
+	await writeSessionFile(claude, process.ppid, {
+		pid: process.ppid,
+		sessionId: "parent",
+	});
+
+	const fromParent = await claudeSessionAbove(claude, process.pid);
+	await writeSessionFile(claude, process.pid, {
+		sessionId: "self",
+		procStart: await ownProcessStart(),
+	});
+	const fromSelf = await claudeSessionAbove(claude, process.pid);
+
+	expect(fromParent).toBe("claude:parent");
+	expect(fromSelf).toBe("claude:self");
+});
+
+test("a pid file whose procStart isn't its process's start doesn't name the Claude session above it", async () => {
+	const { claude } = createTemporaryHome();
+	await writeSessionFile(claude, process.pid, {
+		sessionId: "stale",
+		procStart: "Thu Jan  1 00:00:00 1970",
+	});
+
+	expect(await claudeSessionAbove(claude, process.pid)).toBeNull();
 });
 
 test("a transcript continued in another session reads as replaced by the latest continuation", async () => {
@@ -742,6 +792,29 @@ async function writeLines(path: string, entries: object[]) {
 		path,
 		entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""),
 	);
+}
+
+async function writeSubagent(
+	claude: string,
+	agentId: string,
+	meta: object,
+): Promise<string> {
+	const path = join(
+		claude,
+		"projects",
+		"-work-repo",
+		SESSION_ID,
+		"subagents",
+		`agent-${agentId}.jsonl`,
+	);
+	await writeLines(path, [
+		userLine({ text: "task", agentId, isSidechain: true }),
+	]);
+	await Bun.write(
+		path.replace(/\.jsonl$/, ".meta.json"),
+		JSON.stringify({ agentType: "general-purpose", ...meta }),
+	);
+	return path;
 }
 
 function setModified(path: string, time: Date) {

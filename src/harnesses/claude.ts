@@ -23,6 +23,30 @@ export function createClaudeAdapter(home: string): HarnessAdapter {
 	};
 }
 
+export async function claudeSessionAbove(
+	home: string,
+	pid: number,
+): Promise<string | null> {
+	let current = pid;
+	for (let hop = 0; current > 1 && hop < MAX_PROCESS_HOPS; hop += 1) {
+		const owner = await parentProcessOf(current);
+		if (!owner) {
+			return null;
+		}
+		const record = await readSessionFile(
+			join(home, "sessions", `${current}.json`),
+		);
+		const recorded = parseProcessStart(record?.procStart);
+		const isSameProcess =
+			recorded === null || owner.started === null || recorded === owner.started;
+		if (record?.pid === current && isSameProcess) {
+			return `claude:${record.sessionId}`;
+		}
+		current = owner.parent;
+	}
+	return null;
+}
+
 async function listTranscripts(
 	projects: string,
 	since: Date,
@@ -154,12 +178,12 @@ async function startRecord(
 	};
 	const meta = isSubagent ? await readSubagentMeta(path) : null;
 	const description = meta?.description;
-	const root = isSubagent ? await subagentRoot(path, head.sessionId) : null;
+	const parent = isSubagent ? await subagentParent(path, head, meta) : null;
 	return {
 		id: `claude:${head.agentId ?? head.sessionId}`,
 		harness: "claude",
 		surface: "unknown",
-		parentId: root === null ? null : `claude:${root}`,
+		parentId: parent === null ? null : `claude:${parent}`,
 		title: typeof description === "string" ? description : base.title,
 		cwd: base.cwd,
 		branch: base.branch,
@@ -174,6 +198,22 @@ async function readSubagentMeta(path: string): Promise<SubagentMeta | null> {
 	} catch {
 		return null;
 	}
+}
+
+async function subagentParent(
+	path: string,
+	head: Head,
+	meta: SubagentMeta | null,
+): Promise<string> {
+	const spawner = meta?.parentAgentId;
+	if (
+		typeof spawner === "string" &&
+		spawner !== head.agentId &&
+		(await Bun.file(join(dirname(path), `agent-${spawner}.jsonl`)).exists())
+	) {
+		return spawner;
+	}
+	return subagentRoot(path, head.sessionId);
 }
 
 async function subagentRoot(path: string, sessionId: string): Promise<string> {
@@ -526,10 +566,11 @@ async function snapshotSessions(
 					branch: await branchOf(session.cwd),
 				};
 			}
-			if (
-				!live.has(rawId(session.parentId)) ||
-				!(await isSubagentRunning(session.sourcePath))
-			) {
+			if (!(await isSubagentRunning(session.sourcePath))) {
+				return null;
+			}
+			const root = await rootSessionOf(session.sourcePath);
+			if (root === null || !live.has(root)) {
 				return null;
 			}
 			return {
@@ -661,6 +702,28 @@ function parseProcessStart(text: unknown): number | null {
 	);
 }
 
+async function parentProcessOf(
+	pid: number,
+): Promise<{ parent: number; started: number | null } | null> {
+	const result = await Bun.$`ps -o ppid=,lstart= -p ${pid}`
+		.env({ ...process.env, LC_ALL: "C", TZ: "UTC" })
+		.nothrow()
+		.quiet();
+	const output = result.stdout.toString().trim();
+	const errors = result.stderr.toString().trim();
+	// fact: ps exits 1 with no output and no error when the pid isn't running.
+	if (result.exitCode === 1 && output === "" && errors === "") {
+		return null;
+	}
+	const match = PS_LINE.exec(output);
+	if (result.exitCode !== 0 || !match) {
+		throw new Error(
+			`ps -p ${pid} exited ${result.exitCode} with "${output}": ${errors}`,
+		);
+	}
+	return { parent: Number(match[1]), started: parseProcessStart(match[2]) };
+}
+
 function liveState(status: string | undefined): LiveState {
 	if (status === "waiting") {
 		return "waiting";
@@ -688,6 +751,11 @@ async function isSubagentRunning(path: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
+}
+
+async function rootSessionOf(path: string): Promise<string | null> {
+	const head = await readHead(Bun.file(path));
+	return head === null ? null : subagentRoot(path, head.sessionId);
 }
 
 async function currentBranch(cwd: string): Promise<string | null> {
@@ -753,7 +821,11 @@ type ContentBlock = {
 	content?: unknown;
 };
 
-type SubagentMeta = { description?: unknown; finished?: unknown };
+type SubagentMeta = {
+	description?: unknown;
+	finished?: unknown;
+	parentAgentId?: unknown;
+};
 
 type SessionFile = {
 	pid: number;
@@ -813,6 +885,8 @@ const STATE_PRIORITY: Record<LiveState, number> = {
 };
 
 const PS_LINE = /^\s*(\d+)\s+(.+?)\s*$/;
+
+const MAX_PROCESS_HOPS = 64;
 
 // fact: Claude writes procStart, and `ps -o lstart=` under LC_ALL=C prints, a ctime string such as "Fri Oct  3 16:23:39 2026"; procStart is in UTC.
 const CTIME =

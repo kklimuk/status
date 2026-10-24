@@ -19,6 +19,10 @@ For each adapter in `app.adapters`, in order:
 
 **A non-empty `failures` means the run is half-finished,** and the commands must exit non-zero on it after printing what did sync.
 
+## Progress
+
+Through `app.progress("sync", …)`, which only a terminal sees (`src/cli/AGENTS.md`), per adapter: how many sources it's reading, then how many it read and how many sessions and events it stored, with the reads that failed; the live states its snapshot found, by state; and a failed listing or snapshot with its error. The counts are this adapter's share of the `SyncReport`.
+
 ## Failure isolation
 
 Each step fails on its own and the rest carry on, because one broken transcript shouldn't hide every other session:

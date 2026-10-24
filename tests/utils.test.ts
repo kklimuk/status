@@ -1,5 +1,5 @@
 import { expect, onTestFinished, test } from "bun:test";
-import { askClaude, type ClaudeRequest } from "@src/utils";
+import { askClaude, type ClaudeRequest, formatDuration } from "@src/utils";
 import { chmodSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -107,6 +107,16 @@ test("a result without structured output, or with it outside the output property
 			"no structured output",
 		);
 	}
+});
+
+test("a duration rounds to tenths under a minute and to whole seconds past it, never showing 60s", () => {
+	const after = (milliseconds: number) =>
+		formatDuration(new Date(0), new Date(milliseconds));
+
+	expect(after(2_500)).toBe("2.5s");
+	expect(after(59_960)).toBe("1m 0s");
+	expect(after(119_600)).toBe("2m 0s");
+	expect(after(125_000)).toBe("2m 5s");
 });
 
 async function createFakeClaude({

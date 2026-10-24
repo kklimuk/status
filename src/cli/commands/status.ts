@@ -1,393 +1,331 @@
 import type { App } from "@src/app";
-import { type StatusDatabase, sessions, type summaries } from "@src/database";
-import type { SessionState } from "@src/harnesses";
-import { newestEventIdBySession, summariesBySession } from "@src/summaries";
-import { homedir } from "os";
+import { type StatusDatabase, sessions } from "@src/database";
+import {
+	type Answer,
+	answerQuestion,
+	type Brief,
+	formatAge,
+	type Goal,
+	rootsInWindow,
+	STATUSES,
+	type Status,
+	type StatusRoot,
+	writeBrief,
+} from "@src/statuses";
+import { colorize, formatDuration, pluralize, type Tone } from "@src/utils";
 import { parseArgs } from "util";
 import {
+	type CommandHelp,
 	type CommandResult,
-	colorize,
+	DAYS_OPTION,
+	DEFAULT_DAYS,
 	failure,
+	help,
 	parseDays,
 	refresh,
+	reportTotal,
+	shortenHome,
 	usage,
 } from "../utils";
 
-export const STATUS_USAGE = "status [--days <n>]";
-
-export async function status(
+export async function statusList(
 	args: string[],
 	openApp: () => App,
 ): Promise<CommandResult> {
-	const options = parseOptions(args);
+	const options = parseOptions(args, false);
 	if (options instanceof Error) {
-		return failure(options.message, usage(STATUS_USAGE));
+		return failure(options.message, usage(STATUS_LIST.synopsis));
 	}
 	if (options.help) {
-		return { output: usage(STATUS_USAGE), exitCode: 0 };
+		return { output: help(STATUS_LIST), exitCode: 0 };
 	}
 	const app = openApp();
-	const refreshed = await refresh(app, options.days);
-	const now = app.now();
-	const since = new Date(now.getTime() - options.days * DAY_MS);
-	const triaged = triageRoots(app.database, since);
-	const issues = refreshed.issues ? [refreshed.issues] : [];
-	if (triaged.length === 0) {
-		const output = `No sessions in the last ${pluralize(options.days, "day")}.`;
-		return finish(output, issues, refreshed.failed);
+	const startedAt = app.now();
+	const window = await triageWindow(app, options.days);
+	if (window.roots.length === 0) {
+		reportTotal(app, startedAt, { Haiku: window.haiku }, window.failed);
+		return finish(window.empty, window.issues, window.failed);
 	}
 
-	app.progress(`grouping ${pluralize(triaged.length, "session")} by goal`);
-	const grouped = await groupByGoal(app, triaged, now);
-	const output = [
-		renderTally(grouped.goals, options.days),
-		...grouped.goals.map((goal) => renderGoal(goal, now)),
-	].join("\n\n");
-	return finish(
-		output,
-		[...issues, ...grouped.issues],
-		refreshed.failed || grouped.failed,
+	const brief = await judged(
+		app,
+		`brief ${pluralize(window.roots.length, "session")} by goal`,
+		() => writeBrief(app, window.roots, window.now),
 	);
+	const output = renderBrief(brief, options.days, {
+		names: shortIds(brief.goals, storedSessionIds(app.database)),
+		now: window.now,
+		width: app.outputColumns ?? PIPED_COLUMNS,
+	});
+	const failed = window.failed || brief.failure !== null;
+	reportTotal(
+		app,
+		startedAt,
+		{ Haiku: window.haiku, Opus: brief.opus },
+		failed,
+	);
+	return finish(output, [...window.issues, ...briefIssues(brief)], failed);
 }
 
-function parseOptions(args: string[]) {
+export async function statusGet(
+	args: string[],
+	openApp: () => App,
+): Promise<CommandResult> {
+	const options = parseOptions(args, true);
+	if (options instanceof Error) {
+		return failure(options.message, usage(STATUS_GET.synopsis));
+	}
+	if (options.help) {
+		return { output: help(STATUS_GET), exitCode: 0 };
+	}
+	const [question = ""] = options.positionals;
+	if (options.positionals.length !== 1) {
+		return failure(
+			`get needs one question, quoted as one argument; got ${pluralize(options.positionals.length, "argument")}`,
+			usage(STATUS_GET.synopsis),
+		);
+	}
+	if (question.trim() === "") {
+		return failure(
+			"get needs a question; got a blank one",
+			usage(STATUS_GET.synopsis),
+		);
+	}
+	const app = openApp();
+	const startedAt = app.now();
+	const window = await triageWindow(app, options.days);
+	if (window.roots.length === 0) {
+		reportTotal(app, startedAt, { Haiku: window.haiku }, window.failed);
+		return finish(window.empty, window.issues, window.failed);
+	}
+
+	const answered = await judged(
+		app,
+		`answer "${question.trim()}" over ${pluralize(window.roots.length, "session")}`,
+		() => answerQuestion(app, window.roots, question.trim(), window.now),
+	);
+	const failed = window.failed || answered.failure !== null;
+	reportTotal(
+		app,
+		startedAt,
+		{ Haiku: window.haiku, Opus: answered.opus },
+		failed,
+	);
+	return finish(renderAnswer(answered, window.now), window.issues, failed);
+}
+
+function parseOptions(args: string[], allowPositionals: boolean) {
 	try {
-		const { values } = parseArgs({ args, options: OPTIONS, strict: true });
-		return { ...values, days: parseDays(values.days) };
+		const { values, positionals } = parseArgs({
+			args,
+			options: OPTIONS,
+			strict: true,
+			allowPositionals,
+		});
+		return { ...values, positionals, days: parseDays(values.days) };
 	} catch (error) {
 		return error instanceof Error ? error : new Error(String(error));
 	}
 }
 
-function triageRoots(database: StatusDatabase, since: Date): Triaged[] {
-	const rows = sessionRows(database);
-	const stored = summariesBySession(database);
-	const newestEventIds = newestEventIdBySession(database);
-	const childrenByParent = Map.groupBy(
-		rows.filter((row) => row.parentId !== null),
-		(row) => row.parentId,
-	);
-	return rows
-		.filter((row) => row.parentId === null)
-		.map((root) => {
-			const subagents = descendantsOf(root.id, childrenByParent);
-			const summary = stored.get(root.id) ?? null;
-			const newestEventId = Math.max(
-				...[root, ...subagents].map(
-					(member) => newestEventIds.get(member.id) ?? 0,
-				),
-			);
-			const lastActiveAt = new Date(
-				Math.max(
-					+root.lastEventAt,
-					...subagents.map((subagent) => +subagent.lastEventAt),
-				),
-			);
-			return {
-				session: root,
-				summary,
-				subagents,
-				lastActiveAt,
-				liveSubagents: subagents
-					.filter((subagent) => subagent.state !== "ended")
-					.map((subagent) => ({
-						state: subagent.state,
-						objective:
-							stored.get(subagent.id)?.objective ??
-							subagent.title ??
-							"no summary yet",
-					})),
-				behind: summary === null || newestEventId > summary.throughEventId,
-			};
-		})
-		.filter((triaged) => triaged.lastActiveAt >= since)
-		.sort((left, right) => +right.lastActiveAt - +left.lastActiveAt);
-}
-
-function descendantsOf(
-	sessionId: string,
-	childrenByParent: Map<string | null, SessionRow[]>,
-): SessionRow[] {
-	return (childrenByParent.get(sessionId) ?? []).flatMap((child) => [
-		child,
-		...descendantsOf(child.id, childrenByParent),
-	]);
-}
-
-async function groupByGoal(
-	app: App,
-	triaged: Triaged[],
-	now: Date,
-): Promise<Grouped> {
-	try {
-		const response = await app.askClaude({
-			model: MODEL,
-			effort: "medium",
-			systemPrompt: SYSTEM_PROMPT,
-			input: renderInput(triaged, now),
-			schema: groupingSchema(triaged),
-		});
-		const { goals, missing } = parseGrouping(response.output, triaged);
-		if (missing.length === 0) {
-			return { goals: sortGoals(goals), issues: [], failed: false };
-		}
-		const missingIds = missing.map((item) => item.session.id);
-		return {
-			goals: sortGoals([...goals, ungrouped(missing)]),
-			issues: [
-				`${colorize("warning:", "muted")} the grouping left out ${missingIds.join(", ")}, shown under "${UNGROUPED_GOAL}"`,
-			],
-			failed: false,
-		};
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		return {
-			goals: [ungrouped(triaged)],
-			issues: [`${colorize("failed:", "error")} grouping by goal: ${message}`],
-			failed: true,
-		};
-	}
-}
-
-function renderInput(triaged: Triaged[], now: Date): string {
-	const blocks = triaged.map((item) => {
-		const { session, summary } = item;
-		const lines = [
-			`## ${session.id}`,
-			`live state: ${session.state}`,
-			`title: ${session.title ?? "none"}`,
-			`directory: ${session.cwd}`,
-			`branch: ${session.branch ?? "none"}`,
-			`last activity: ${item.lastActiveAt.toISOString()} (${formatAge(item.lastActiveAt, now)})`,
-			`subagents: ${item.subagents.length}, ${item.liveSubagents.length} not ended`,
-			...item.liveSubagents.map(
-				(subagent) => `- ${subagent.state} subagent: ${subagent.objective}`,
-			),
-		];
-		if (summary === null) {
-			return [...lines, "summary: none"].join("\n");
-		}
-		return [
-			...lines,
-			`summary${item.behind ? BEHIND_NOTE : ""}:`,
-			`objective: ${summary.objective}`,
-			renderList("progress", summary.progress),
-			renderList("next", summary.next),
-			renderList("blockers", summary.blockers),
-			`waiting on: ${summary.waitingOn}`,
-			...(summary.ask ? [`ask: ${summary.ask}`] : []),
-			`outcome: ${summary.outcome}`,
-		].join("\n");
-	});
-	return [`Now: ${now.toISOString()}`, ...blocks].join("\n\n");
-}
-
-function renderList(name: string, column: string): string {
-	const items = splitList(column);
-	if (items.length === 0) {
-		return `${name}: none`;
-	}
-	return [`${name}:`, ...items.map((entry) => `- ${entry}`)].join("\n");
-}
-
-function splitList(column: string): string[] {
-	return column.split("\n").filter((entry) => entry.trim() !== "");
-}
-
-function groupingSchema(triaged: Triaged[]): Record<string, unknown> {
-	const text = { type: "string", pattern: "\\S" };
-	const session = {
-		type: "object",
-		properties: {
-			id: { type: "string", enum: triaged.map((item) => item.session.id) },
-			bucket: { type: "string", enum: BUCKETS },
-			line: text,
-		},
-		required: ["id", "bucket", "line"],
-		additionalProperties: false,
-	};
-	const goal = {
-		type: "object",
-		properties: { name: text, sessions: { type: "array", items: session } },
-		required: ["name", "sessions"],
-		additionalProperties: false,
-	};
+async function triageWindow(app: App, days: number) {
+	const refreshed = await refresh(app, days);
+	const now = app.now();
+	const since = new Date(now.getTime() - days * DAY_MS);
 	return {
-		type: "object",
-		properties: { goals: { type: "array", items: goal } },
-		required: ["goals"],
-		additionalProperties: false,
+		now,
+		roots: rootsInWindow(app.database, since),
+		haiku: refreshed.haiku,
+		failed: refreshed.failed,
+		issues: refreshed.issues ? [refreshed.issues] : [],
+		empty: `No sessions in the last ${pluralize(days, "day")}.`,
 	};
 }
 
-function parseGrouping(
-	output: unknown,
-	triaged: Triaged[],
-): { goals: Goal[]; missing: Triaged[] } {
-	const byId = new Map(triaged.map((item) => [item.session.id, item]));
-	const seen = new Set<string>();
-	const goals = requireArray(
-		(output as { goals?: unknown } | null)?.goals,
-		"goals",
-	).map((goal) => ({
-		name: requireText(
-			(goal as { name?: unknown })?.name,
-			"a goal's name",
-		).replace(/\s+/g, " "),
-		sessions: requireArray(
-			(goal as { sessions?: unknown })?.sessions,
-			"a goal's sessions",
-		).map((entry) => {
-			const id = requireText((entry as { id?: unknown })?.id, "a session's id");
-			const item = byId.get(id);
-			if (!item) {
-				throw new Error(
-					`the answer names a session that wasn't asked about: ${id}`,
-				);
-			}
-			if (seen.has(id)) {
-				throw new Error(`the answer lists ${id} more than once`);
-			}
-			seen.add(id);
-			const bucket = requireBucket((entry as { bucket?: unknown })?.bucket);
-			const line = requireText(
-				(entry as { line?: unknown })?.line,
-				"a session's line",
-			);
-			return { ...item, bucket, line };
-		}),
-	}));
-	return {
-		goals: goals.filter((goal) => goal.sessions.length > 0),
-		missing: triaged.filter((item) => !seen.has(item.session.id)),
-	};
-}
-
-function requireArray(value: unknown, name: string): unknown[] {
-	if (!Array.isArray(value)) {
-		throw new Error(`the answer's ${name} isn't a list`);
-	}
-	return value;
-}
-
-function requireText(value: unknown, name: string): string {
-	if (typeof value !== "string" || value.trim() === "") {
-		throw new Error(`the answer is missing ${name}`);
-	}
-	return value.trim();
-}
-
-function requireBucket(value: unknown): Bucket {
-	const bucket = BUCKETS.find((candidate) => candidate === value);
-	if (!bucket) {
-		throw new Error(
-			`the answer gives a bucket that isn't one of ${BUCKETS.join(", ")}: ${JSON.stringify(value)}`,
+async function judged<
+	Result extends { failure: string | null; opus: { inputTokens: number } },
+>(app: App, task: string, call: () => Promise<Result>): Promise<Result> {
+	app.progress("judge", `asking Opus to ${task}`);
+	const startedAt = app.now();
+	const result = await call();
+	const took = formatDuration(startedAt, app.now());
+	if (result.failure !== null) {
+		app.progress(
+			"judge",
+			`${colorize("failed", "error")} after ${took}: ${result.failure}`,
 		);
+		return result;
 	}
-	return bucket;
+	const tokens = result.opus.inputTokens.toLocaleString("en-US");
+	app.progress(
+		"judge",
+		`${colorize("answered", "finished")} in ${took}, ${tokens} input tokens`,
+	);
+	return result;
 }
 
-function ungrouped(triaged: Triaged[]): Goal {
-	return {
-		name: UNGROUPED_GOAL,
-		sessions: triaged.map((item) => ({
-			...item,
-			bucket: null,
-			line: item.summary?.objective ?? item.session.title ?? "no summary yet",
-		})),
-	};
-}
-
-function sortGoals(goals: Goal[]): Goal[] {
-	return goals
-		.map((goal) => ({ goal, ...urgencyOf(goal) }))
-		.sort(
-			(left, right) => left.rank - right.rank || +right.latest - +left.latest,
-		)
-		.map(({ goal }) => goal);
-}
-
-function urgencyOf(goal: Goal): { rank: number; latest: Date } {
-	return {
-		rank: Math.min(...goal.sessions.map((item) => rankOf(item.bucket))),
-		latest: new Date(
-			Math.max(...goal.sessions.map((item) => +item.lastActiveAt)),
-		),
-	};
-}
-
-function rankOf(bucket: Bucket | null): number {
-	return bucket === null ? BUCKETS.length : BUCKETS.indexOf(bucket);
-}
-
-function renderTally(goals: Goal[], days: number): string {
-	const listed = goals.flatMap((goal) => goal.sessions);
-	const judged = listed.some((item) => item.bucket !== null);
-	const counts = judged
-		? BUCKETS.map((bucket) => {
-				const count = listed.filter((item) => item.bucket === bucket).length;
-				return colorize(`${count} ${BUCKET_LABELS[bucket]}`, bucket);
-			})
-		: [];
-	const ungroupedCount = listed.filter((item) => item.bucket === null).length;
-	if (ungroupedCount > 0) {
-		counts.push(`${ungroupedCount} not grouped`);
+function briefIssues(brief: Brief): string[] {
+	if (brief.failure !== null) {
+		return [
+			`${colorize("failed:", "error")} writing the brief: ${brief.failure}`,
+		];
 	}
-	return `${counts.join(" · ")}  ${colorize(`last ${pluralize(days, "day")}`, "muted")}`;
+	if (brief.ungrouped.length === 0) {
+		return [];
+	}
+	const ids = brief.ungrouped.map((root) => root.session.id).join(", ");
+	return [
+		`${colorize("warning:", "muted")} the brief left out ${ids}, shown under ${UNGROUPED_HEADING}`,
+	];
 }
 
-function renderGoal(goal: Goal, now: Date): string {
-	const buckets = BUCKETS.flatMap((bucket) => {
-		const members = goal.sessions
-			.filter((item) => item.bucket === bucket)
-			.sort((left, right) => +right.lastActiveAt - +left.lastActiveAt);
-		if (members.length === 0) {
+function renderAnswer(answered: Answer, now: Date): string {
+	if (answered.failure !== null) {
+		return `${colorize("failed:", "error")} answering the question: ${answered.failure}`;
+	}
+	if (answered.sessions.length === 0) {
+		return answered.answer;
+	}
+	return [
+		answered.answer,
+		"",
+		colorize("sessions:", "heading"),
+		...answered.sessions.map((root) => `  ${headline(root, now)}`),
+	].join("\n");
+}
+
+function renderBrief(brief: Brief, days: number, layout: Layout): string {
+	const sections = STATUSES.flatMap((status) => {
+		const goals = brief.goals.filter((goal) => goal.status === status);
+		if (goals.length === 0) {
 			return [];
 		}
-		return [
-			`  ${colorize(BUCKET_LABELS[bucket], bucket)}`,
-			...members.flatMap((item) => renderSession(item, now)),
-		];
+		const heading = colorize(STATUS_HEADINGS[status], STATUS_TONES[status]);
+		if (status === "finished") {
+			const lines = goals.map((goal) => renderFinishedGoal(goal, layout));
+			return [`${heading}\n${lines.join("\n")}`];
+		}
+		const blocks = goals.map((goal, index) =>
+			renderGoal(goal, index + 1, layout),
+		);
+		return [`${heading}\n${blocks.join("\n\n")}`];
 	});
-	const unbucketed = goal.sessions
-		.filter((item) => item.bucket === null)
-		.flatMap((item) => renderSession(item, now));
-	return [colorize(goal.name, "heading"), ...buckets, ...unbucketed].join("\n");
+	if (brief.ungrouped.length > 0) {
+		const body = brief.ungrouped
+			.map((item) => renderUngrouped(item, layout))
+			.join("\n\n");
+		sections.push(`${colorize(UNGROUPED_HEADING, "muted")}\n${body}`);
+	}
+	return [renderTally(brief, days), ...sections].join("\n\n");
 }
 
-function renderSession(item: GoalSession, now: Date): string[] {
-	const { session } = item;
-	const directory = shortenHome(session.cwd);
-	const place = session.branch ? `${directory} (${session.branch})` : directory;
-	const details = [session.state, place, formatAge(item.lastActiveAt, now)];
-	if (item.summary === null) {
-		details.push("no summary");
-	} else if (item.behind) {
-		details.push("summary behind");
+function renderTally(brief: Brief, days: number): string {
+	const parts = [`Last ${pluralize(days, "day")}`];
+	if (brief.goals.length > 0) {
+		const count = (status: Status) =>
+			brief.goals.filter((goal) => goal.status === status).length;
+		const needYou = count("needs_you");
+		parts.push(
+			colorize(
+				`${pluralize(needYou, "goal")} ${needYou === 1 ? "needs" : "need"} you`,
+				"blocked",
+			),
+			colorize(`${count("running")} running`, "running"),
+			colorize(`${count("finished")} finished`, "finished"),
+		);
 	}
+	if (brief.ungrouped.length > 0) {
+		parts.push(`${pluralize(brief.ungrouped.length, "session")} not grouped`);
+	}
+	return parts.join(" · ");
+}
+
+function renderGoal(
+	goal: Goal,
+	position: number,
+	{ names, now, width }: Layout,
+): string {
+	const fields: [string, string[]][] = [
+		["Goal:", wrap(goal.goal, width - GOAL_INDENT - LABEL_WIDTH)],
+		["Done:", renderItems(goal.done, "bullet", width)],
+		["Blockers:", renderItems(goal.blockers, "bullet", width)],
+		[
+			goal.status === "running" ? "Now:" : "Next:",
+			renderItems(goal.next, "numbered", width),
+		],
+	];
+	const indent = " ".repeat(GOAL_INDENT);
+	const lines = [colorize(`${position}. ${goal.name}`, "heading")];
+	for (const [label, body] of fields) {
+		for (const [index, line] of body.entries()) {
+			const prefix = index === 0 ? label : "";
+			lines.push(`${indent}${prefix.padEnd(LABEL_WIDTH)}${line}`);
+		}
+	}
+	lines.push(
+		...goal.sessions.map((item) => `${indent}${footnote(item, names, now)}`),
+	);
+	return lines.join("\n");
+}
+
+function renderItems(
+	items: string[],
+	style: "bullet" | "numbered",
+	width: number,
+): string[] {
+	return items.flatMap((item, index) => {
+		const marker = style === "bullet" ? "- " : `${index + 1}. `;
+		const hanging = " ".repeat(marker.length);
+		const room = width - GOAL_INDENT - LABEL_WIDTH - marker.length;
+		return wrap(item, room).map((line, lineIndex) => {
+			const lead = lineIndex === 0 ? marker : hanging;
+			return `${lead}${line}`;
+		});
+	});
+}
+
+function renderFinishedGoal(goal: Goal, { names, width }: Layout): string {
+	const result = goal.done.join("; ") || goal.goal;
+	const text = `${goal.name}: ${result}`;
+	const ids = goal.sessions
+		.map((item) => names.get(item.session.id) ?? item.session.id)
+		.join(", ");
+	const lines = wrap(text, width - 2).map((line, index) =>
+		index === 0 ? `- ${line}` : `  ${line}`,
+	);
+	const idLines = wrap(ids, width - 4).map((line, index) =>
+		colorize(index === 0 ? `  ↳ ${line}` : `    ${line}`, "muted"),
+	);
+	return [...lines, ...idLines].join("\n");
+}
+
+function renderUngrouped(item: StatusRoot, { now, width }: Layout): string {
+	const objective =
+		item.summary?.objective ?? item.session.title ?? "no summary yet";
 	const lines = [
-		`    ${session.id}  ${colorize(details.join(" · "), "muted")}`,
-		`      ${item.line.replace(/\s+/g, " ")}`,
+		`- ${headline(item, now)}`,
+		...indentWrapped(objective, width),
 	];
 	const ask = askOf(item);
-	if (!ask) {
-		return lines;
+	if (ask) {
+		lines.push(
+			...indentWrapped(`ask: ${ask}`, width).map((line) =>
+				colorize(line, "blocked"),
+			),
+		);
 	}
-	const askLines = `ask: ${ask}`
-		.split("\n")
-		.filter((line) => line.trim() !== "");
-	return [
-		...lines,
-		...askLines.map((line, index) =>
-			colorize(`${index === 0 ? "      " : "        "}${line}`, "blocked"),
-		),
-	];
+	return lines.join("\n");
 }
 
-function askOf(item: GoalSession): string | null {
-	if (item.bucket === "running" || item.bucket === "finished") {
-		return null;
-	}
+function indentWrapped(text: string, width: number): string[] {
+	return text
+		.split("\n")
+		.filter((paragraph) => paragraph.trim() !== "")
+		.flatMap((paragraph) => wrap(paragraph, width - 2))
+		.map((line) => `  ${line}`);
+}
+
+function askOf(item: StatusRoot): string | null {
 	if (item.summary?.ask) {
 		return item.summary.ask;
 	}
@@ -400,30 +338,76 @@ function askOf(item: GoalSession): string | null {
 	return null;
 }
 
-function shortenHome(path: string): string {
-	const home = homedir();
-	if (path !== home && !path.startsWith(`${home}/`)) {
-		return path;
+function footnote(
+	item: StatusRoot,
+	names: Map<string, string>,
+	now: Date,
+): string {
+	const details = [
+		`${item.session.state} ${formatAge(item.lastActiveAt, now)}`,
+	];
+	if (item.liveSubagents.length > 0) {
+		details.push(`+ ${pluralize(item.liveSubagents.length, "agent")}`);
 	}
-	return `~${path.slice(home.length)}`;
+	if (item.summary === null) {
+		details.push("no summary");
+	} else if (item.behind) {
+		details.push("summary behind");
+	}
+	const name = names.get(item.session.id) ?? item.session.id;
+	return colorize(`↳ ${name} · ${details.join(" · ")}`, "muted");
 }
 
-function formatAge(at: Date, now: Date): string {
-	const minutes = Math.floor((+now - +at) / 60_000);
-	if (minutes < 1) {
-		return "just now";
-	}
-	if (minutes < 60) {
-		return `${minutes}m ago`;
-	}
-	if (minutes < 48 * 60) {
-		return `${Math.floor(minutes / 60)}h ago`;
-	}
-	return `${Math.floor(minutes / (24 * 60))}d ago`;
+function shortIds(goals: Goal[], storedIds: string[]): Map<string, string> {
+	const ids = goals.flatMap((goal) =>
+		goal.sessions.map((item) => item.session.id),
+	);
+	return new Map(
+		ids.map((id) => {
+			const start = id.indexOf(":") + 1;
+			let length = SHORT_ID_CHARS;
+			while (
+				start + length < id.length &&
+				storedIds.some(
+					(other) =>
+						other !== id && other.startsWith(id.slice(0, start + length)),
+				)
+			) {
+				length += 1;
+			}
+			return [id, id.slice(0, start + length)];
+		}),
+	);
 }
 
-function pluralize(count: number, noun: string): string {
-	return `${count} ${noun}${count === 1 ? "" : "s"}`;
+function wrap(text: string, width: number): string[] {
+	const room = Math.max(width, MIN_WRAP_COLUMNS);
+	const lines: string[] = [];
+	let line = "";
+	for (const word of text.split(/\s+/).filter((part) => part !== "")) {
+		if (line === "") {
+			line = word;
+		} else if (Bun.stringWidth(`${line} ${word}`) <= room) {
+			line = `${line} ${word}`;
+		} else {
+			lines.push(line);
+			line = word;
+		}
+	}
+	return line === "" ? lines : [...lines, line];
+}
+
+function headline(item: StatusRoot, now: Date): string {
+	const { session } = item;
+	const directory = shortenHome(session.cwd);
+	const place = session.branch ? `${directory} (${session.branch})` : directory;
+	const details = [session.state, place, formatAge(item.lastActiveAt, now)];
+	if (item.summary === null) {
+		details.push("no summary");
+	} else if (item.behind) {
+		details.push("summary behind");
+	}
+	return `${session.id}  ${colorize(details.join(" · "), "muted")}`;
 }
 
 function finish(
@@ -437,98 +421,63 @@ function finish(
 	};
 }
 
-function sessionRows(database: StatusDatabase): SessionRow[] {
+function storedSessionIds(database: StatusDatabase): string[] {
 	return database
-		.select({
-			id: sessions.id,
-			parentId: sessions.parentId,
-			title: sessions.title,
-			cwd: sessions.cwd,
-			branch: sessions.branch,
-			state: sessions.state,
-			lastEventAt: sessions.lastEventAt,
-		})
+		.select({ id: sessions.id })
 		.from(sessions)
-		.all();
+		.all()
+		.map((row) => row.id);
 }
 
-type SessionRow = {
-	id: string;
-	parentId: string | null;
-	title: string | null;
-	cwd: string;
-	branch: string | null;
-	state: SessionState;
-	lastEventAt: Date;
+type Layout = { names: Map<string, string>; now: Date; width: number };
+
+export const STATUS_LIST: CommandHelp = {
+	name: "list",
+	synopsis: "status list [--days <n>]",
+	about:
+		"A daily brief of the sessions active in the window, by goal: what each goal is, what was done, its blockers and what to do next.",
+	details:
+		"Syncs, brings the summaries up to date, then asks Opus to group the root sessions into goals and write each one up: needs you (numbered in the order to take them), running, or finished (one line each). Exits 1 when a sync, a summary or the brief failed, after printing what it has.",
+	options: [DAYS_OPTION],
 };
 
-type SummaryRow = typeof summaries.$inferSelect;
-
-type Bucket = (typeof BUCKETS)[number];
-
-type Triaged = {
-	session: SessionRow;
-	summary: SummaryRow | null;
-	subagents: SessionRow[];
-	liveSubagents: { state: SessionState; objective: string }[];
-	lastActiveAt: Date;
-	behind: boolean;
+export const STATUS_GET: CommandHelp = {
+	name: "get",
+	synopsis: "status get <question> [--days <n>]",
+	about:
+		"Ask Opus one question about the sessions active in the window; prints its answer and the sessions it relied on.",
+	details:
+		"Quote the question as one argument: status get \"what's blocked on me in lamplighter?\". Opus reads the same input as list: each root session's live state, directory, branch, activity, live subagents and summary.",
+	options: [DAYS_OPTION],
 };
-
-type GoalSession = Triaged & { bucket: Bucket | null; line: string };
-
-type Goal = { name: string; sessions: GoalSession[] };
-
-type Grouped = { goals: Goal[]; issues: string[]; failed: boolean };
 
 const OPTIONS = {
-	days: { type: "string", default: "7" },
+	days: { type: "string", default: String(DEFAULT_DAYS) },
 	help: { type: "boolean", short: "h" },
 } as const;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-const MODEL = "claude-opus-5-5";
+const STATUS_HEADINGS: Record<Status, string> = {
+	needs_you: "NEEDS YOU",
+	running: "RUNNING",
+	finished: "FINISHED",
+};
 
-const BUCKETS = ["blocked", "running", "finished"] as const;
-
-const BUCKET_LABELS: Record<Bucket, string> = {
-	blocked: "blocked on you",
+const STATUS_TONES: Record<Status, Tone> = {
+	needs_you: "blocked",
 	running: "running",
 	finished: "finished",
 };
 
-const UNGROUPED_GOAL = "Not grouped";
+const UNGROUPED_HEADING = "NOT GROUPED";
 
-const BEHIND_NOTE = " (behind: the session has moved on since it was written)";
+const PIPED_COLUMNS = 100;
 
-const SYSTEM_PROMPT = `You prepare a developer's morning triage of their coding-agent sessions (Claude Code and Codex). The input lists each root session active recently: its live state, directory, branch, last activity, the subagents that haven't ended, and a rolling summary of what it did. Subagents' work is already folded into their parent's summary.
+const MIN_WRAP_COLUMNS = 30;
 
-Return goals, each with its sessions, and for each session a bucket and one line.
+const GOAL_INDENT = 3;
 
-Buckets: judge each session by who has the next move.
-- blocked: the next move is the developer's. They must answer, approve, decide, review, or resume or drop work that stopped partway.
-- running: an agent or something external (a build, CI, a background job, another person) is making progress, and the developer needn't act yet.
-- finished: nothing is left for anyone. The work is delivered or deliberately abandoned, and nothing is proposed or pending.
+const SHORT_ID_CHARS = 8;
 
-Live states, as observed just now:
-- waiting: a permission prompt or a question is open in the session right now; someone has to answer it before it continues.
-- busy: the agent is working on a turn right now.
-- idle: the session is open but its turn ended; it continues only when someone sends a message, unless something it started (a background job) wakes it.
-- ended: the process is gone. Nothing runs until the developer resumes it.
-A subagent's state counts toward its root: a waiting subagent holds its root on the same prompt, a busy one is still working for it, and an idle one waits on its root, not on the developer.
-
-Weigh the live state with the summary. The summary's outcome, waiting on, ask, next and blockers say what the session thought was left when its summary was written; the live state and last activity say what's true now. An open ask on an ended session may be stale, or may still be the decision the developer owes: judge from its age and whether later work moved past it. A summary marked behind may lag the session; don't guess past what it says, and lean on the live state.
-
-Goals:
-- A goal is the outcome the developer is pursuing: a feature, a fix, a release, an investigation, a document. Group sessions that serve the same outcome, even across directories, worktrees and harnesses (a coordinator session and the stream sessions it launched for the same project phase share a goal).
-- Don't merge unrelated work into one goal because it shares a directory, and don't split one outcome across goals because its sessions use different branches.
-- Name a goal in 2 to 6 words, specific and in sentence case: the project and the outcome ("status: summaries command", "Fix flaky login test"). Never a catch-all like "Misc" or "Other work". A session that fits no other goal gets its own.
-
-Sessions:
-- List every input session exactly once, under one goal, with its id copied exactly from its "##" heading. Never invent an id.
-- One line, at most about 120 characters, plain language, no session id, that fits the bucket you chose:
-  - blocked: where the work stands and what the developer needs to do. The session's ask, when it has one, is printed under your line verbatim, so don't restate it; give the context that makes it quick to answer. With no ask, say what's needed.
-  - running: what it's doing now.
-  - finished: what it delivered, with commit hashes, PR numbers or file names when the summary has them. When it was abandoned, say so and why.
-- Keep exact identifiers (commands, hashes, file names) when they help; drop narration about the agent ("The agent then...").`;
+const LABEL_WIDTH = "Blockers: ".length;

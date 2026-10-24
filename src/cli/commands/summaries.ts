@@ -1,103 +1,132 @@
 import type { App } from "@src/app";
-import { events, type StatusDatabase, sessions } from "@src/database";
-import type { SessionState } from "@src/harnesses";
-import { newestEventIdBySession, summariesBySession } from "@src/summaries";
-import { and, desc, eq, gte, inArray, isNotNull } from "drizzle-orm";
-import { join } from "path";
+import {
+	type Catalog,
+	type CatalogSession,
+	callerSessionIds,
+	filesEditedBy,
+	type ListedSession,
+	listSessions,
+	onlyMatch,
+	RECENT_TOOL_CALLS,
+	readCatalog,
+	recentToolCalls,
+	sessionsMatching,
+} from "@src/summaries";
+import { colorize, pluralize, STATE_TONES, type Tone } from "@src/utils";
 import { parseArgs } from "util";
 import {
+	type CommandHelp,
 	type CommandResult,
-	colorize,
+	DAYS_OPTION,
+	DEFAULT_DAYS,
 	failure,
+	help,
 	parseDays,
 	type Refresh,
 	refresh,
+	reportTotal,
+	shortenHome,
 	usage,
 } from "../utils";
 
-export const SUMMARIES_USAGE =
-	"status summaries [--days <n>] [--all] [--session <id>]";
-
-export async function summaries(
+export async function summariesList(
 	args: string[],
 	openApp: () => App,
 ): Promise<CommandResult> {
-	const options = parseOptions(args);
+	const options = parseListOptions(args);
 	if (options instanceof Error) {
-		return failure(options.message, usage(SUMMARIES_USAGE));
+		return failure(options.message, usage(SUMMARIES_LIST.synopsis));
 	}
 	if (options.help) {
-		return { output: usage(SUMMARIES_USAGE), exitCode: 0 };
+		return { output: help(SUMMARIES_LIST), exitCode: 0 };
 	}
+	const { days } = options;
 	const app = openApp();
-	const refreshed = await refresh(app, options.days);
+	const startedAt = app.now();
+	const refreshed = await refresh(app, days);
 	const catalog = readCatalog(app);
-	if (options.session !== undefined) {
-		const session = catalog.sessions.get(options.session);
-		if (!session) {
-			const unknown = failure(`unknown session "${options.session}"`);
-			return { ...finish(unknown.output, refreshed), exitCode: 1 };
-		}
-		return finish(renderSession(app, catalog, session), refreshed);
-	}
 	const callers = await callerSessionIds(app);
-	const since = new Date(app.now().getTime() - options.days * DAY_MS);
-	const isListed = (session: SessionRow) =>
-		!callers.ids.has(session.id) &&
-		(session.state !== "ended" ||
-			(options.all === true && session.lastEventAt >= since));
-	const filter = { isListed, callers: callers.ids, all: options.all === true };
-	return finish(renderList(app, catalog, filter), refreshed, callers.warnings);
+	const since = new Date(app.now().getTime() - days * DAY_MS);
+	const filter = { callers: callers.ids, all: options.all === true, since };
+	const listed = listSessions(catalog, filter);
+	reportTotal(app, startedAt, { Haiku: refreshed.haiku }, refreshed.failed);
+	return finish(
+		renderList(app, catalog, listed, filter),
+		refreshed,
+		callers.warnings,
+	);
 }
 
-function parseOptions(args: string[]) {
+export async function summariesGet(
+	args: string[],
+	openApp: () => App,
+): Promise<CommandResult> {
+	const options = parseGetOptions(args);
+	if (options instanceof Error) {
+		return failure(options.message, usage(SUMMARIES_GET.synopsis));
+	}
+	if (options.values.help) {
+		return { output: help(SUMMARIES_GET), exitCode: 0 };
+	}
+	const [sessionId] = options.positionals;
+	if (options.positionals.length !== 1 || !sessionId) {
+		return failure(
+			`summaries get needs one session id; got ${pluralize(options.positionals.length, "argument")}`,
+			usage(SUMMARIES_GET.synopsis),
+		);
+	}
+	const app = openApp();
+	const startedAt = app.now();
+	let matches: CatalogSession[] = [];
+	const refreshed = await refresh(app, DEFAULT_DAYS, () => {
+		matches = sessionsMatching(app.database, sessionId);
+		return { sessionId: onlyMatch(matches)?.id ?? sessionId };
+	});
+	const catalog = readCatalog(app);
+	const match = onlyMatch(matches);
+	const session = match ? catalog.sessions.get(match.id) : undefined;
+	reportTotal(
+		app,
+		startedAt,
+		{ Haiku: refreshed.haiku },
+		refreshed.failed || !session,
+	);
+	if (session) {
+		return finish(renderSession(app, catalog, session), refreshed);
+	}
+	if (matches.length === 0) {
+		const unknown = failure(`unknown session "${sessionId}"`);
+		return { ...finish(unknown.output, refreshed), exitCode: 1 };
+	}
+	const candidates = matches.map(
+		(candidate) => `  ${candidate.id}  ${candidate.title ?? "untitled"}`,
+	);
+	const ambiguous = failure(
+		`"${sessionId}" matches ${matches.length} sessions; give more of the id:\n${candidates.join("\n")}`,
+	);
+	return { ...finish(ambiguous.output, refreshed), exitCode: 1 };
+}
+
+function parseListOptions(args: string[]) {
 	try {
-		const { values } = parseArgs({ args, options: OPTIONS, strict: true });
+		const { values } = parseArgs({ args, options: LIST_OPTIONS, strict: true });
 		return { ...values, days: parseDays(values.days) };
 	} catch (error) {
 		return error instanceof Error ? error : new Error(String(error));
 	}
 }
 
-function readCatalog(app: App): Catalog {
-	const rows = sessionRows(app.database).sort(
-		(left, right) =>
-			+right.startedAt - +left.startedAt || left.id.localeCompare(right.id),
-	);
-	const children = Map.groupBy(
-		rows.filter((row) => row.parentId !== null),
-		(row) => row.parentId,
-	);
-	const stored = summariesBySession(app.database);
-	const newestEventIds = newestEventIdBySession(app.database);
-	const familyNewest = new Map<string, number>();
-	function newestInFamily(id: string): number {
-		const known = familyNewest.get(id);
-		if (known !== undefined) {
-			return known;
-		}
-		const newest = Math.max(
-			newestEventIds.get(id) ?? 0,
-			...(children.get(id) ?? []).map((child) => newestInFamily(child.id)),
-		);
-		familyNewest.set(id, newest);
-		return newest;
+function parseGetOptions(args: string[]) {
+	try {
+		return parseArgs({
+			args,
+			options: GET_OPTIONS,
+			strict: true,
+			allowPositionals: true,
+		});
+	} catch (error) {
+		return error instanceof Error ? error : new Error(String(error));
 	}
-	const editedSince = new Date(app.now().getTime() - EDIT_WINDOW_MS);
-	return {
-		sessions: new Map(rows.map((row) => [row.id, row])),
-		children,
-		summaries: stored,
-		behind: new Set(
-			rows
-				.filter((row) => {
-					const summary = stored.get(row.id);
-					return summary && newestInFamily(row.id) > summary.throughEventId;
-				})
-				.map((row) => row.id),
-		),
-		edits: editCallsSince(app.database, editedSince),
-	};
 }
 
 function finish(
@@ -117,16 +146,9 @@ function finish(
 	};
 }
 
-function renderSession(app: App, catalog: Catalog, session: SessionRow) {
-	const edits = editedFiles(catalog, (member) =>
-		entryOf(catalog, member, (entry) => entry.id === session.id, new Set()),
-	);
-	const lines = renderEntry(app, catalog, session, {
-		depth: 0,
-		under: null,
-		callers: new Set(),
-		edited: edits.get(session.id) ?? [],
-	});
+function renderSession(app: App, catalog: Catalog, session: CatalogSession) {
+	const edited = filesEditedBy(catalog, session.id);
+	const lines = renderEntry(app, catalog, session, edited);
 	const subagents: string[] = [];
 	function visit(parentId: string, depth: number) {
 		for (const child of catalog.children.get(parentId) ?? []) {
@@ -165,62 +187,11 @@ function renderSession(app: App, catalog: Catalog, session: SessionRow) {
 	return lines.join("\n");
 }
 
-function editedFiles(
-	catalog: Catalog,
-	ownerOf: (session: SessionRow) => string | null,
-): Map<string, string[]> {
-	const files = new Map<string, Set<string>>();
-	for (const edit of catalog.edits) {
-		const session = catalog.sessions.get(edit.sessionId);
-		const owner = session ? ownerOf(session) : null;
-		if (owner === null) {
-			continue;
-		}
-		const owned = files.get(owner) ?? new Set();
-		for (const file of splitItems(edit.toolTarget ?? "")) {
-			owned.add(file);
-		}
-		files.set(owner, owned);
-	}
-	return new Map([...files].map(([id, owned]) => [id, [...owned]]));
-}
-
-function entryOf(
-	catalog: Catalog,
-	session: SessionRow,
-	hasEntry: (session: SessionRow) => boolean,
-	callers: Set<string>,
-): string | null {
-	for (const member of [session, ...ancestorsOf(catalog, session)]) {
-		if (callers.has(member.id)) {
-			return null;
-		}
-		if (hasEntry(member)) {
-			return member.id;
-		}
-	}
-	return null;
-}
-
-function ancestorsOf(catalog: Catalog, session: SessionRow): SessionRow[] {
-	const ancestors: SessionRow[] = [];
-	let parentId = session.parentId;
-	while (parentId !== null) {
-		const parent = catalog.sessions.get(parentId);
-		if (!parent) {
-			break;
-		}
-		ancestors.push(parent);
-		parentId = parent.parentId;
-	}
-	return ancestors;
-}
-
 function renderEntry(
 	app: App,
 	catalog: Catalog,
-	session: SessionRow,
-	placement: Placement,
+	session: CatalogSession,
+	edited: string[],
 ): string[] {
 	const summary = catalog.summaries.get(session.id);
 	const lines = [headline(app, catalog, session)];
@@ -232,10 +203,8 @@ function renderEntry(
 	if (session.title) {
 		field("title", session.title);
 	}
-	const parent = session.parentId;
-	if (parent !== null && parent !== placement.under) {
-		const yours = placement.callers.has(parent) ? " (this session)" : "";
-		field("parent", `${parent}${yours}`);
+	if (session.parentId !== null) {
+		field("parent", session.parentId);
 	}
 	field("cwd", session.cwd);
 	field("branch", session.branch ?? "none");
@@ -249,12 +218,11 @@ function renderEntry(
 			lines.push(...listField(label, splitItems(summary[column])));
 		}
 	}
-	lines.push(...listField(EDITED_LABEL, placement.edited));
-	const indent = "    ".repeat(placement.depth);
-	return lines.map((line) => `${indent}${line}`);
+	lines.push(...listField(EDITED_LABEL, edited));
+	return lines;
 }
 
-function headline(app: App, catalog: Catalog, session: SessionRow): string {
+function headline(app: App, catalog: Catalog, session: CatalogSession): string {
 	const parts = [
 		colorize(session.id, "heading"),
 		colorize(session.state, STATE_TONES[session.state]),
@@ -302,125 +270,40 @@ function minute(at: Date): string {
 	return `${at.toISOString().slice(0, 16).replace("T", " ")}Z`;
 }
 
-async function callerSessionIds(app: App): Promise<Callers> {
-	const ids = new Set<string>();
-	if (process.env.CODEX_THREAD_ID) {
-		ids.add(`codex:${process.env.CODEX_THREAD_ID}`);
-	}
-	try {
-		const claudeSession = await claudeSessionAbove(
-			join(app.paths.claude, "sessions"),
-			process.pid,
-		);
-		if (claudeSession) {
-			ids.add(claudeSession);
-		}
-		return { ids, warnings: [] };
-	} catch (error) {
-		const reason = error instanceof Error ? error.message : String(error);
-		const warning = `couldn't find the Claude session running this, so it may be listed: ${reason}`;
-		return { ids, warnings: [warning] };
-	}
-}
-
-async function claudeSessionAbove(
-	directory: string,
-	pid: number,
-): Promise<string | null> {
-	let current = pid;
-	for (let hop = 0; current > 1 && hop < MAX_PROCESS_HOPS; hop += 1) {
-		const owner = await processOf(current);
-		if (!owner) {
-			return null;
-		}
-		const sessionId = await claudeSessionOfProcess(
-			join(directory, `${current}.json`),
-			current,
-			owner.started,
-		);
-		if (sessionId) {
-			return `claude:${sessionId}`;
-		}
-		current = owner.parent;
-	}
-	return null;
-}
-
-async function processOf(
-	pid: number,
-): Promise<{ parent: number; started: string } | null> {
-	const result = await Bun.$`ps -o ppid=,lstart= -p ${pid}`
-		.env({ ...process.env, LC_ALL: "C", TZ: "UTC" })
-		.nothrow()
-		.quiet();
-	const output = result.stdout.toString().trim();
-	const errors = result.stderr.toString().trim();
-	// fact: ps exits 1 with no output and no error when the pid isn't running.
-	if (result.exitCode === 1 && output === "" && errors === "") {
-		return null;
-	}
-	const match = PS_LINE.exec(output);
-	if (result.exitCode !== 0 || !match) {
-		throw new Error(
-			`ps -p ${pid} exited ${result.exitCode} with "${output}": ${errors}`,
-		);
-	}
-	return { parent: Number(match[1]), started: collapseSpaces(match[2] ?? "") };
-}
-
-async function claudeSessionOfProcess(
-	path: string,
-	pid: number,
-	started: string,
-): Promise<string | null> {
-	try {
-		const record = await Bun.file(path).json();
-		if (record?.pid !== pid || typeof record.sessionId !== "string") {
-			return null;
-		}
-		const isSameProcess =
-			typeof record.procStart !== "string" ||
-			collapseSpaces(record.procStart) === started;
-		return isSameProcess ? record.sessionId : null;
-	} catch {
-		return null;
-	}
-}
-
 function collapseSpaces(text: string): string {
 	return text.trim().replace(/\s+/g, " ");
 }
 
-function renderList(app: App, catalog: Catalog, filter: ListFilter): string {
-	const listed = [...catalog.sessions.values()].filter(filter.isListed);
-	const placed = Map.groupBy(
-		listed,
-		(session) =>
-			ancestorsOf(catalog, session).find(filter.isListed)?.id ?? null,
-	);
-	const edits = editedFiles(catalog, (session) =>
-		entryOf(catalog, session, filter.isListed, filter.callers),
-	);
-	const lines = [listHeading(listed.length, filter)];
-	function place(session: SessionRow, depth: number, under: string | null) {
-		const placement = {
+function renderList(
+	app: App,
+	catalog: Catalog,
+	listed: ListedSession[],
+	filter: { callers: Set<string>; all: boolean },
+): string {
+	const heading = listHeading(listed.length, filter);
+	if (listed.length === 0) {
+		return heading;
+	}
+	const isTerminal = app.outputColumns !== null;
+	const shortIds = isTerminal
+		? shortestUniqueIds([...catalog.sessions.keys()])
+		: null;
+	const rows = listed.map(({ session, depth, edited }) => {
+		const id = shortIds?.get(session.id) ?? session.id;
+		return tableRow(app, catalog, session, {
+			id,
 			depth,
-			under,
-			callers: filter.callers,
-			edited: edits.get(session.id) ?? [],
-		};
-		lines.push("", ...renderEntry(app, catalog, session, placement));
-		for (const child of placed.get(session.id) ?? []) {
-			place(child, depth + 1, session.id);
-		}
-	}
-	for (const top of placed.get(null) ?? []) {
-		place(top, 0, null);
-	}
-	return lines.join("\n");
+			edited: edited.length,
+			isTerminal,
+		});
+	});
+	return [heading, "", ...renderTable(rows, app.outputColumns)].join("\n");
 }
 
-function listHeading(count: number, filter: ListFilter): string {
+function listHeading(
+	count: number,
+	filter: { callers: Set<string>; all: boolean },
+): string {
 	const noun = count === 1 ? "session" : "sessions";
 	const scope = filter.all ? `${count} ${noun}` : `${count} live ${noun}`;
 	if (filter.callers.size === 0) {
@@ -430,97 +313,146 @@ function listHeading(count: number, filter: ListFilter): string {
 	return colorize(`${scope}, leaving out this session: ${callers}`, "heading");
 }
 
-function sessionRows(database: StatusDatabase): SessionRow[] {
-	return database
-		.select({
-			id: sessions.id,
-			parentId: sessions.parentId,
-			title: sessions.title,
-			cwd: sessions.cwd,
-			branch: sessions.branch,
-			state: sessions.state,
-			startedAt: sessions.startedAt,
-			lastEventAt: sessions.lastEventAt,
-		})
-		.from(sessions)
-		.all();
+function tableRow(
+	app: App,
+	catalog: Catalog,
+	session: CatalogSession,
+	row: { id: string; depth: number; edited: number; isTerminal: boolean },
+): Cell[] {
+	const directory = shortenHome(session.cwd);
+	const objective =
+		catalog.summaries.get(session.id)?.objective ?? session.title ?? "";
+	const active = age(app.now(), session.lastEventAt);
+	return [
+		{ text: treeId(session, row.id, row.depth) },
+		{ text: session.state, tone: STATE_TONES[session.state] },
+		{ text: row.isTerminal ? active.replace(/ ago$/, "") : active },
+		waitingCell(catalog, session),
+		{ text: String(row.edited) },
+		{ text: session.branch ? `${directory} (${session.branch})` : directory },
+		{ text: collapseSpaces(objective) },
+	];
 }
 
-function editCallsSince(database: StatusDatabase, since: Date): EditCall[] {
-	return database
-		.select({ sessionId: events.sessionId, toolTarget: events.toolTarget })
-		.from(events)
-		.where(
-			and(
-				inArray(events.toolName, EDIT_TOOLS),
-				inArray(events.toolStatus, ["ok", "pending"]),
-				isNotNull(events.toolTarget),
-				gte(events.at, since),
-			),
-		)
-		.orderBy(desc(events.at), desc(events.id))
-		.all();
+function treeId(session: CatalogSession, id: string, depth: number): string {
+	if (depth > 0) {
+		return `${"  ".repeat(depth - 1)}└ ${id}`;
+	}
+	return session.parentId === null ? id : `↑ ${id}`;
 }
 
-function recentToolCalls(
-	database: StatusDatabase,
-	sessionId: string,
-	limit: number,
-) {
-	return database
-		.select({
-			at: events.at,
-			toolName: events.toolName,
-			toolTarget: events.toolTarget,
-			toolStatus: events.toolStatus,
-		})
-		.from(events)
-		.where(and(eq(events.sessionId, sessionId), eq(events.role, "tool")))
-		.orderBy(desc(events.at), desc(events.id))
-		.limit(limit)
-		.all();
+function shortestUniqueIds(ids: string[]): Map<string, string> {
+	const sorted = [...ids].sort();
+	return new Map(
+		sorted.map((id, index) => {
+			const neighbors = [sorted[index - 1], sorted[index + 1]];
+			const shared = Math.max(
+				0,
+				...neighbors.map((other) => sharedPrefixLength(id, other ?? "")),
+			);
+			const harnessLength = id.indexOf(":") + 1;
+			const length = Math.max(harnessLength + SHORT_ID_CHARS, shared + 1);
+			return [id, id.slice(0, length)];
+		}),
+	);
 }
 
-type SessionRow = {
-	id: string;
-	parentId: string | null;
-	title: string | null;
-	cwd: string;
-	branch: string | null;
-	state: SessionState;
-	startedAt: Date;
-	lastEventAt: Date;
+function sharedPrefixLength(left: string, right: string): number {
+	let length = 0;
+	while (length < left.length && left[length] === right[length]) {
+		length += 1;
+	}
+	return length;
+}
+
+function waitingCell(catalog: Catalog, session: CatalogSession): Cell {
+	const summary = catalog.summaries.get(session.id);
+	if (!summary) {
+		return { text: "no summary", tone: "blocked" };
+	}
+	if (catalog.behind.has(session.id)) {
+		return { text: "behind", tone: "blocked" };
+	}
+	return { text: summary.waitingOn, tone: WAITING_TONES[summary.waitingOn] };
+}
+
+function renderTable(rows: Cell[][], columns: number | null): string[] {
+	const headings = TABLE_HEADINGS.map((text) => ({
+		text,
+		tone: "heading" as const,
+	}));
+	const table = [headings, ...rows];
+	const widths = headings.map((_, index) =>
+		Math.max(...table.map((row) => Bun.stringWidth(row[index]?.text ?? ""))),
+	);
+	const fixed = widths
+		.slice(0, -1)
+		.reduce((sum, width) => sum + width + COLUMN_GAP.length, 0);
+	const room = Math.max(
+		MIN_OBJECTIVE_WIDTH,
+		(columns ?? Number.POSITIVE_INFINITY) - fixed,
+	);
+	return table.map((row) =>
+		row
+			.map((cell, index) => {
+				const isLast = index === row.length - 1;
+				const width = widths[index] ?? 0;
+				const text = isLast ? fit(cell.text, room) : padEnd(cell.text, width);
+				return cell.tone ? colorize(text, cell.tone) : text;
+			})
+			.join(COLUMN_GAP),
+	);
+}
+
+function padEnd(text: string, width: number): string {
+	return text + " ".repeat(Math.max(0, width - Bun.stringWidth(text)));
+}
+
+function fit(text: string, room: number): string {
+	if (Bun.stringWidth(text) <= room) {
+		return text;
+	}
+	let kept = "";
+	for (const { segment } of new Intl.Segmenter().segment(text)) {
+		if (Bun.stringWidth(kept + segment) > room - 1) {
+			break;
+		}
+		kept += segment;
+	}
+	return `${kept.trimEnd()}…`;
+}
+
+type Cell = { text: string; tone?: Tone };
+
+export const SUMMARIES_LIST: CommandHelp = {
+	name: "summaries list",
+	synopsis: "status summaries list [--days <n>] [--all]",
+	about:
+		"List the live sessions and their summaries, for agents to read before they act.",
+	details:
+		"One row per session: ID (subagents as a tree), STATE, ACTIVE, WAITING, EDITS (files edited in the last 30 minutes), DIR and OBJECTIVE, cut to the terminal's width and printed in full when piped. It leaves out the session that runs it. Drill into a row with status summaries get <id>.",
+	options: [
+		DAYS_OPTION,
+		["--all", "add ended sessions whose last event is in the window"],
+	],
 };
 
-type EditCall = { sessionId: string; toolTarget: string | null };
-
-type Catalog = {
-	sessions: Map<string, SessionRow>;
-	children: Map<string | null, SessionRow[]>;
-	summaries: ReturnType<typeof summariesBySession>;
-	behind: Set<string>;
-	edits: EditCall[];
+export const SUMMARIES_GET: CommandHelp = {
+	name: "summaries get",
+	synopsis: "status summaries get <session_id>",
+	about: "Bring one session's summary up to date and show it in full.",
+	details:
+		"Refreshes that session and its subagents, even when it's busy, then shows its whole summary (progress, tried, next, blockers, the ask), the files it edited in the last 30 minutes, its parent, its subagents and its last 20 tool calls. Takes any id another command printed, whatever its state.",
+	options: [],
 };
 
-type Placement = {
-	depth: number;
-	under: string | null;
-	callers: Set<string>;
-	edited: string[];
-};
-
-type ListFilter = {
-	isListed(session: SessionRow): boolean;
-	callers: Set<string>;
-	all: boolean;
-};
-
-type Callers = { ids: Set<string>; warnings: string[] };
-
-const OPTIONS = {
-	days: { type: "string", default: "7" },
+const LIST_OPTIONS = {
+	days: { type: "string", default: String(DEFAULT_DAYS) },
 	all: { type: "boolean" },
-	session: { type: "string" },
+	help: { type: "boolean", short: "h" },
+} as const;
+
+const GET_OPTIONS = {
 	help: { type: "boolean", short: "h" },
 } as const;
 
@@ -533,30 +465,28 @@ const LIST_FIELDS = [
 
 const EDITED_LABEL = "edited in the last 30m";
 
-const EDIT_WINDOW_MS = 30 * 60_000;
+const TABLE_HEADINGS = [
+	"ID",
+	"STATE",
+	"ACTIVE",
+	"WAITING",
+	"EDITS",
+	"DIR",
+	"OBJECTIVE",
+] as const;
 
-// fact: Claude Code edits files with its Edit, MultiEdit, Write and NotebookEdit tools.
-const EDIT_TOOLS = [
-	"Edit",
-	"MultiEdit",
-	"Write",
-	"NotebookEdit",
-	"apply_patch",
-];
+const COLUMN_GAP = "  ";
 
-const STATE_TONES = {
-	busy: "running",
-	waiting: "blocked",
-	idle: "finished",
-	ended: "muted",
-} as const;
+const SHORT_ID_CHARS = 8;
 
-const RECENT_TOOL_CALLS = 20;
+const MIN_OBJECTIVE_WIDTH = 20;
+
+const WAITING_TONES = {
+	user: "blocked",
+	external: "running",
+	none: "muted",
+} as const satisfies Record<string, Tone>;
 
 const MAX_TARGET_CHARS = 300;
 
-const MAX_PROCESS_HOPS = 64;
-
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-const PS_LINE = /^(\d+)\s+(.+)$/;

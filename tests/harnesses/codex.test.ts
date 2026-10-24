@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, onTestFinished, test } from "bun:test";
 import {
+	codexSessionIn,
 	createCodexAdapter,
 	type SessionEvent,
 	type SessionRecord,
@@ -20,6 +21,14 @@ import { join } from "path";
 
 const PARENT = "01a00000-0000-7000-8000-000000000001";
 const CHILD = "01a00000-0000-7000-8000-000000000002";
+
+test("the Codex session running this is the one CODEX_THREAD_ID names", () => {
+	expect(codexSessionIn({ CODEX_THREAD_ID: "thread-self" })).toBe(
+		"codex:thread-self",
+	);
+	expect(codexSessionIn({ CODEX_THREAD_ID: "" })).toBeNull();
+	expect(codexSessionIn({})).toBeNull();
+});
 
 test("listSources returns rollouts modified since the cutoff", async () => {
 	const home = createTemporaryHome();

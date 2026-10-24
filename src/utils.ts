@@ -1,3 +1,5 @@
+import type { SessionState } from "@src/harnesses";
+
 export type ClaudeRequest = {
 	model: string;
 	effort?: "low" | "medium" | "high" | "xhigh" | "max";
@@ -53,6 +55,28 @@ export async function askClaude(
 	};
 }
 
+export function colorize(text: string, tone: Tone): string {
+	const code = Bun.color(TONES[tone], "ansi");
+	return code ? `${code}${text}${RESET}` : text;
+}
+
+export function formatDuration(from: Date, to: Date): string {
+	const tenths = Math.round(Math.max(0, +to - +from) / 100);
+	if (tenths < 600) {
+		return `${(tenths / 10).toFixed(1)}s`;
+	}
+	const seconds = Math.round(tenths / 10);
+	return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+export function pluralize(count: number, noun: string): string {
+	return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+export function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 function claudeArguments(request: ClaudeRequest): string[] {
 	const effort = request.effort ? ["--effort", request.effort] : [];
 	return [
@@ -104,6 +128,8 @@ type ClaudeResult = {
 	usage?: TokenUsage & { iterations?: TokenUsage[] };
 };
 
+export type Tone = keyof typeof TONES;
+
 type TokenUsage = {
 	input_tokens?: number;
 	cache_read_input_tokens?: number;
@@ -111,3 +137,21 @@ type TokenUsage = {
 };
 
 const TIMEOUT_MS = 10 * 60_000;
+
+const TONES = {
+	heading: "#3e9eff",
+	error: "#e5484d",
+	running: "#12a594",
+	blocked: "#ffb224",
+	finished: "#46a758",
+	muted: "#8b8d98",
+};
+
+export const STATE_TONES = {
+	busy: "running",
+	waiting: "blocked",
+	idle: "finished",
+	ended: "muted",
+} as const satisfies Record<SessionState, Tone>;
+
+const RESET = "\x1b[0m";

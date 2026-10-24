@@ -54,7 +54,7 @@ test("a session without a summary is summarized from all its events, through its
 	});
 });
 
-test("a summary is refreshed only after new events, from the previous summary, the first user message and those events", async () => {
+test("a summary is refreshed only after new events, from the previous summary and those events alone", async () => {
 	const claude = fakeClaude();
 	const app = createTestApp({ askClaude: claude.askClaude, now: () => NOW });
 	addSession(app, "claude:root");
@@ -75,9 +75,7 @@ test("a summary is refreshed only after new events, from the previous summary, t
 	const input = claude.requests[1]?.input ?? "";
 	expect(input).toContain("## Summary so far");
 	expect(input).toContain("objective: Add rolling summaries");
-	expect(input).toContain(
-		"## First user message\n\nAdd rolling summaries to status",
-	);
+	expect(input).not.toContain("Add rolling summaries to status");
 	expect(input).toContain("The schema needs no change.");
 	expect(input).not.toContain("Starting with the schema.");
 });
@@ -297,7 +295,7 @@ test("a busy session without a summary is summarized right away", async () => {
 	});
 });
 
-test("a session too long for one prompt is summarized in chunks, each after the first carrying the summary so far and the first user message", async () => {
+test("a session too long for one prompt is summarized in chunks, each after the first carrying the summary so far instead of earlier entries", async () => {
 	const claude = fakeClaude((_request, index) => ({
 		...SUMMARY,
 		objective: `objective from chunk ${index + 1}`,
@@ -319,9 +317,7 @@ test("a session too long for one prompt is summarized in chunks, each after the 
 	}
 	const second = claude.requests[1]?.input ?? "";
 	expect(second).toContain("objective: objective from chunk 1");
-	expect(second).toContain(
-		"## First user message\n\nSummarize the release notes",
-	);
+	expect(second).not.toContain("Summarize the release notes");
 	expect(second).toContain("note 19");
 	expect(second).not.toContain("note 0 ");
 	expect(storedSummary(app, "claude:root")?.objective).toBe(
@@ -349,21 +345,29 @@ test("text outside ASCII is chunked by its bytes, so a CJK session stays under t
 	}
 });
 
-test("a message too long for a chunk is cut in the middle, keeping its start and end", async () => {
+test("a message bigger than a chunk goes whole into a chunk of its own, never cut", async () => {
 	const claude = fakeClaude();
 	const app = createTestApp({ askClaude: claude.askClaude, now: () => NOW });
 	addSession(app, "claude:root");
+	const huge = `START ${"x".repeat(CHUNK_BYTES)} END`;
 	addEvents(app, "claude:root", [
-		message("user", `START ${"x".repeat(500_000)} END`, 0),
+		message("user", "Read the log", 0),
+		message("assistant", `before ${"y".repeat(CHUNK_BYTES / 2)}`, 1),
+		message("user", huge, 2),
+		message("assistant", "after", 3),
 	]);
 
-	await refreshSummaries(app);
+	const report = await refreshSummaries(app);
 
-	const input = claude.requests[0]?.input ?? "";
-	expect(input).toContain("START");
-	expect(input).toContain("END");
-	expect(input).toContain("characters cut");
-	expect(input.length).toBeLessThan(20_000);
+	expect(report.roots).toMatchObject({ refreshed: 1, calls: 3 });
+	const inputs = claude.requests.map((request) => request.input);
+	expect(inputs[0]).toContain("before ");
+	expect(inputs[0]).not.toContain("START");
+	expect(inputs[1]).toContain(`[2026-10-23 09:02 user]\n${huge}`);
+	expect(inputs[1]).not.toContain("before ");
+	expect(inputs[1]).not.toContain("after");
+	expect(inputs[2]).toContain("after");
+	expect(inputs.join("")).not.toContain("characters cut");
 });
 
 test("a failed call keeps the old summary, and the others still refresh", async () => {
@@ -438,53 +442,6 @@ test("an answer that doesn't match the summary schema fails closed", async () =>
 	expect(storedSummary(app, "claude:root")).toBeUndefined();
 });
 
-test("an ask comes exactly with waiting on the user, and a done session waits on no one, or the summary fails closed", async () => {
-	const answers: Record<string, Record<string, unknown>> = {
-		"claude:offered": { waiting_on: "user", ask: "Push and open a PR?" },
-		"claude:unlabeled": { waiting_on: "none", ask: "Push and open a PR?" },
-		"claude:unasked": { waiting_on: "user", ask: null },
-		"claude:contradicted": {
-			waiting_on: "user",
-			ask: "Push and open a PR?",
-			outcome: "done",
-		},
-	};
-	const claude = fakeClaude((request) => {
-		const id = Object.keys(answers).find((key) => request.input.includes(key));
-		return { ...SUMMARY, ...answers[id ?? ""] };
-	});
-	const app = createTestApp({ askClaude: claude.askClaude, now: () => NOW });
-	for (const id of Object.keys(answers)) {
-		addSession(app, id);
-		addEvents(app, id, [message("user", `Work on ${id}`, 0)]);
-	}
-
-	const report = await refreshSummaries(app);
-
-	expect(storedSummary(app, "claude:offered")).toMatchObject({
-		waitingOn: "user",
-		ask: "Push and open a PR?",
-	});
-	expect(
-		report.failures.toSorted((left, right) =>
-			left.sessionId.localeCompare(right.sessionId),
-		),
-	).toEqual([
-		{
-			sessionId: "claude:contradicted",
-			message: "Haiku returned outcome done while waiting_on is user",
-		},
-		{
-			sessionId: "claude:unasked",
-			message: "Haiku returned waiting_on user without an ask",
-		},
-		{
-			sessionId: "claude:unlabeled",
-			message: "Haiku returned an ask while waiting_on is none",
-		},
-	]);
-});
-
 test("a prompt over 100,000 tokens is reported, but a retried call whose prompts each stayed under is not", async () => {
 	const claude = fakeClaude();
 	const app = createTestApp({ askClaude: claude.askClaude, now: () => NOW });
@@ -513,13 +470,14 @@ test("a prompt over 100,000 tokens is reported, but a retried call whose prompts
 	expect(large.failures).toEqual([]);
 });
 
-test("at most four calls run at once, and progress counts the sessions", async () => {
+test("at most ten calls run at once, and progress logs each one as it starts and finishes", async () => {
 	let running = 0;
 	let mostRunning = 0;
-	const progress: string[] = [];
+	const lines: string[] = [];
 	const app = createTestApp({
 		now: () => NOW,
-		progress: (line) => progress.push(line),
+		progress: (tag, message) =>
+			lines.push(`[${tag}] ${Bun.stripANSI(message)}`),
 		askClaude: async () => {
 			running += 1;
 			mostRunning = Math.max(mostRunning, running);
@@ -532,23 +490,142 @@ test("at most four calls run at once, and progress counts the sessions", async (
 			};
 		},
 	});
-	for (const index of [1, 2, 3, 4, 5, 6]) {
-		addSession(app, `claude:${index}`);
+	for (const index of Array.from({ length: 12 }, (_, at) => at + 1)) {
+		addSession(app, `claude:${index}`, { title: `Task ${index}` });
 		addEvents(app, `claude:${index}`, [message("user", "Work", 0)]);
 	}
 
 	const report = await refreshSummaries(app);
 
-	expect(report.roots.refreshed).toBe(6);
-	expect(mostRunning).toBe(4);
-	expect(progress).toEqual([
-		"summarizing 1/6",
-		"summarizing 2/6",
-		"summarizing 3/6",
-		"summarizing 4/6",
-		"summarizing 5/6",
-		"summarizing 6/6",
+	expect(report.roots.refreshed).toBe(12);
+	expect(mostRunning).toBe(10);
+	expect(lines[0]).toBe(
+		"[summaries] 12 to refresh, 0 of them subagents, 10 at a time",
+	);
+	expect(lines.slice(1, 3)).toEqual([
+		"[summaries] started 1/12 claude:1 · Task 1",
+		"[summaries] started 2/12 claude:2 · Task 2",
 	]);
+	expect(lines).toContain(
+		"[summaries] done 1/12 claude:1 · Task 1 in 0.0s, 1 call",
+	);
+	expect(lines.at(-1)).toBe(
+		"[summaries] 12 refreshed · 12 Haiku calls · 18,000 input tokens",
+	);
+});
+
+test("progress names a failed summary and a deferred root", async () => {
+	const lines: string[] = [];
+	const app = createTestApp({
+		now: () => NOW,
+		progress: (tag, message) =>
+			lines.push(`[${tag}] ${Bun.stripANSI(message)}`),
+		askClaude: async () => {
+			throw new Error("claude -p exited with code 1");
+		},
+	});
+	addSession(app, "claude:busy", { state: "busy" });
+	addEvents(app, "claude:busy", [message("user", "Work", 0)]);
+	app.database
+		.insert(summaries)
+		.values({ ...storedRow("claude:busy"), updatedAt: NOW })
+		.run();
+	addEvents(app, "claude:busy", [message("assistant", "Still going", 1)]);
+	addSession(app, "claude:broken");
+	addEvents(app, "claude:broken", [message("user", "Work", 0)]);
+
+	await refreshSummaries(app);
+
+	expect(lines).toEqual([
+		"[summaries] deferred 1 busy root summarized under 15m ago: claude:busy",
+		"[summaries] 1 to refresh, 0 of them subagents, 10 at a time",
+		"[summaries] started 1/1 claude:broken",
+		"[summaries] failed 1/1 claude:broken after 0.0s: claude -p exited with code 1",
+		"[summaries] 0 refreshed · 1 failed · 0 Haiku calls · 0 input tokens",
+	]);
+});
+
+test("progress doesn't call the summaries current when the only stale family was deferred", async () => {
+	const lines: string[] = [];
+	const app = createTestApp({
+		now: () => NOW,
+		progress: (tag, message) =>
+			lines.push(`[${tag}] ${Bun.stripANSI(message)}`),
+	});
+	addSession(app, "claude:busy", { state: "busy" });
+	addEvents(app, "claude:busy", [message("user", "Work", 0)]);
+	app.database
+		.insert(summaries)
+		.values({ ...storedRow("claude:busy"), updatedAt: NOW })
+		.run();
+	addEvents(app, "claude:busy", [message("assistant", "Still going", 1)]);
+
+	await refreshSummaries(app);
+
+	expect(lines).toEqual([
+		"[summaries] deferred 1 busy root summarized under 15m ago: claude:busy",
+		"[summaries] nothing else to refresh",
+	]);
+});
+
+test("a scoped refresh brings only that session and its subagents up to date, even while it's busy", async () => {
+	const claude = fakeClaude();
+	let now = NOW;
+	const app = createTestApp({ askClaude: claude.askClaude, now: () => now });
+	addSession(app, "claude:root", { state: "busy" });
+	addSession(app, "claude:agent", { parentId: "claude:root", state: "busy" });
+	addSession(app, "claude:nested", { parentId: "claude:agent", state: "busy" });
+	addSession(app, "claude:sibling", { parentId: "claude:root", state: "busy" });
+	addSession(app, "claude:other");
+	for (const id of [
+		"claude:root",
+		"claude:agent",
+		"claude:nested",
+		"claude:sibling",
+	]) {
+		addEvents(app, id, [message("user", `Work on ${id}`, 0)]);
+	}
+	await refreshSummaries(app);
+	for (const id of [
+		"claude:root",
+		"claude:agent",
+		"claude:nested",
+		"claude:sibling",
+		"claude:other",
+	]) {
+		addEvents(app, id, [message("assistant", `More from ${id}`, 1)]);
+	}
+	claude.requests.length = 0;
+	now = new Date(+NOW + 60_000);
+
+	const report = await refreshSummaries(app, { sessionId: "claude:agent" });
+
+	expect(report).toMatchObject({
+		roots: { refreshed: 0 },
+		subagents: { refreshed: 2 },
+		deferred: [],
+		failures: [],
+	});
+	expect(
+		claude.requests.map((request) =>
+			request.input.includes("More from claude:nested"),
+		),
+	).toEqual([true, false]);
+	expect(claude.requests[1]?.input).toContain("More from claude:agent");
+	expect(storedSummary(app, "claude:root")?.updatedAt).toEqual(NOW);
+	expect(storedSummary(app, "claude:sibling")?.updatedAt).toEqual(NOW);
+	expect(storedSummary(app, "claude:other")).toBeUndefined();
+});
+
+test("a scoped refresh of an unknown session does nothing", async () => {
+	const app = createTestApp({ now: () => NOW });
+	addSession(app, "claude:root");
+	addEvents(app, "claude:root", [message("user", "Work", 0)]);
+
+	const report = await refreshSummaries(app, { sessionId: "claude:nope" });
+
+	expect(report.roots.calls + report.subagents.calls).toBe(0);
+	expect(report.failures).toEqual([]);
 });
 
 test("a summary that covers more events, written by another run meanwhile, is never replaced", async () => {

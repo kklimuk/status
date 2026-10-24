@@ -14,6 +14,7 @@ import type {
 	SessionSnapshot,
 	SourceRead,
 } from "@src/harnesses";
+import { colorize, describeError, pluralize, STATE_TONES } from "@src/utils";
 import { and, eq, gte, inArray, ne, notInArray, or } from "drizzle-orm";
 
 export async function sync(app: App, since: Date): Promise<SyncReport> {
@@ -43,9 +44,22 @@ async function ingest(
 		paths = await adapter.listSources(since);
 	} catch (error) {
 		report.failures.push(issue(harness, "list", null, error));
+		app.progress(
+			"sync",
+			`${harness}: ${colorize("failed", "error")} to list sources: ${describeError(error)}`,
+		);
 		return [];
 	}
-	app.progress(`syncing ${paths.length} ${harness} sources`);
+	app.progress(
+		"sync",
+		`${harness}: reading ${pluralize(paths.length, "source")}`,
+	);
+	const before = {
+		sources: report.sources,
+		sessions: report.sessions,
+		events: report.events,
+		failures: report.failures.length,
+	};
 	for (const path of paths) {
 		try {
 			const read = await adapter.readSource(
@@ -78,6 +92,14 @@ async function ingest(
 			report.failures.push(issue(harness, "read", path, error));
 		}
 	}
+	const failed = report.failures.length - before.failures;
+	const stored = `${pluralize(report.sessions - before.sessions, "session")} and ${pluralize(report.events - before.events, "event")}`;
+	const failures =
+		failed > 0 ? `, ${colorize(`${failed} failed`, "error")}` : "";
+	app.progress(
+		"sync",
+		`${harness}: read ${pluralize(report.sources - before.sources, "source")}, stored ${stored}${failures}`,
+	);
 	return paths;
 }
 
@@ -286,9 +308,30 @@ async function observe(
 				observedAt,
 			);
 		});
+		const recorded = snapshots.filter((snapshot) =>
+			candidateIds.has(snapshot.sessionId),
+		);
+		app.progress("sync", `${harness}: ${describeLiveStates(recorded)}`);
 	} catch (error) {
 		report.failures.push(issue(harness, "snapshot", null, error));
+		app.progress(
+			"sync",
+			`${harness}: ${colorize("failed", "error")} to read live states: ${describeError(error)}`,
+		);
 	}
+}
+
+function describeLiveStates(snapshots: SessionSnapshot[]): string {
+	if (snapshots.length === 0) {
+		return "no live sessions";
+	}
+	const counts = LIVE_STATES.flatMap((state) => {
+		const count = snapshots.filter(
+			(snapshot) => snapshot.state === state,
+		).length;
+		return count > 0 ? [`${count} ${colorize(state, STATE_TONES[state])}`] : [];
+	});
+	return `${pluralize(snapshots.length, "live session")}: ${counts.join(", ")}`;
 }
 
 function recordLiveState(
@@ -353,8 +396,7 @@ function issue(
 	source: string | null,
 	problem: unknown,
 ): SyncIssue {
-	const message = problem instanceof Error ? problem.message : String(problem);
-	return { harness, step, source, message };
+	return { harness, step, source, message: describeError(problem) };
 }
 
 function sessionBySourcePath(
@@ -417,5 +459,7 @@ export type SyncIssue = {
 };
 
 type StoredSession = typeof sessions.$inferSelect;
+
+const LIVE_STATES = ["waiting", "busy", "idle"] as const;
 
 type Transaction = Parameters<Parameters<StatusDatabase["transaction"]>[0]>[0];

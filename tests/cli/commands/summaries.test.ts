@@ -5,8 +5,6 @@ import { events, sessions, summaries } from "@src/database";
 import type { SessionState, ToolStatus } from "@src/harnesses";
 import { createTestApp } from "@tests/utils";
 import { eq } from "drizzle-orm";
-import { mkdirSync } from "fs";
-import { join } from "path";
 
 let savedThreadId: string | undefined;
 
@@ -23,13 +21,18 @@ afterEach(() => {
 	}
 });
 
-test("live sessions are listed with their subagents nested under them, and --all adds ended ones", async () => {
+test("the list is a table of live sessions, subagents as a tree under their parent", async () => {
 	const app = testApp();
 	addSession(app, "claude:root", { state: "busy", startedMinutesAgo: 50 });
 	addSession(app, "claude:helper", {
 		parentId: "claude:root",
 		state: "busy",
 		startedMinutesAgo: 40,
+	});
+	addSession(app, "claude:nested", {
+		parentId: "claude:helper",
+		state: "busy",
+		startedMinutesAgo: 35,
 	});
 	addSession(app, "claude:done-helper", {
 		parentId: "claude:root",
@@ -39,6 +42,7 @@ test("live sessions are listed with their subagents nested under them, and --all
 	addSession(app, "codex:other", { state: "waiting", startedMinutesAgo: 10 });
 	addSession(app, "codex:old", { state: "ended", startedMinutesAgo: 120 });
 	const covered = [
+		"claude:nested",
 		"claude:helper",
 		"claude:done-helper",
 		"claude:root",
@@ -47,229 +51,164 @@ test("live sessions are listed with their subagents nested under them, and --all
 	].map((id) => {
 		const newest = Math.max(...addEvents(app, id, [message(5)]));
 		if (id !== "claude:root") {
-			addSummary(app, id, [newest]);
+			addSummary(app, id, [newest], { objective: `Objective of ${id}` });
 		}
 		return newest;
 	});
-	addSummary(app, "claude:root", covered);
+	addSummary(app, "claude:root", covered, { objective: "Ship it" });
 
-	const live = await runSummaries(app, []);
-	const all = await runSummaries(app, ["--all"]);
+	const live = await runSummaries(app, ["list"]);
 
 	expect(live.exitCode).toBe(0);
-	expect(headlines(live.output)).toEqual([
-		"codex:other  waiting  active 5m ago",
-		"claude:root  busy  active 5m ago",
-		"    claude:helper  busy  active 5m ago",
-	]);
-	expect(live.output).toStartWith("3 live sessions\n");
-	expect(all.exitCode).toBe(0);
-	expect(headlines(all.output)).toEqual([
-		"codex:other  waiting  active 5m ago",
-		"claude:root  busy  active 5m ago",
-		"    claude:helper  busy  active 5m ago",
-		"    claude:done-helper  ended  active 5m ago",
-		"codex:old  ended  active 5m ago",
-	]);
+	expect(live.output).toBe(
+		[
+			"4 live sessions",
+			"",
+			"ID                 STATE    ACTIVE  WAITING  EDITS  DIR    OBJECTIVE",
+			"codex:other        waiting  5m ago  none     0      /work  Objective of codex:other",
+			"claude:root        busy     5m ago  none     0      /work  Ship it",
+			"└ claude:helper    busy     5m ago  none     0      /work  Objective of claude:helper",
+			"  └ claude:nested  busy     5m ago  none     0      /work  Objective of claude:nested",
+		].join("\n"),
+	);
 });
 
-test("an entry shows its directory, branch, summary fields one per line, and the ask when it waits on the user", async () => {
+test("a row shows the directory with its branch, what the session waits on, and its edits as a count", async () => {
 	const app = testApp();
 	addSession(app, "claude:root", {
 		state: "waiting",
-		title: "Add the summaries command",
 		cwd: "/work/status",
 		branch: "stream/2e",
 	});
-	addSummary(app, "claude:root", addEvents(app, "claude:root", [message(5)]), {
-		progress: "Wrote the command\nWrote the tests",
-		tried: "",
+	const ids = addEvents(app, "claude:root", [
+		toolCall("Edit", "/work/status/a.ts", "ok", 4),
+		toolCall("Write", "/work/status/b.ts", "ok", 3),
+		toolCall("Edit", "/work/status/a.ts", "ok", 2),
+	]);
+	addSummary(app, "claude:root", ids, {
+		objective: "Ship it\nwith  the tests",
 		waitingOn: "user",
-		ask: "Push the branch?\nThe tests pass.",
+		ask: "Push the branch?",
+		progress: "Wrote the command",
 	});
 
-	const result = await runSummaries(app, []);
+	const result = await runSummaries(app, ["list"]);
 
-	expect(result.output).toBe(
+	expect(rowsOf(result.output)).toEqual([
 		[
-			"1 live session",
-			"",
-			"claude:root  waiting  active 5m ago",
-			"  title: Add the summaries command",
-			"  cwd: /work/status",
-			"  branch: stream/2e",
-			"  objective: Ship it",
-			"  outcome: in_progress, waiting on user",
-			"  ask: Push the branch?",
-			"    The tests pass.",
-			"  progress:",
-			"    - Wrote the command",
-			"    - Wrote the tests",
-			"  tried: none",
-			"  next: none",
-			"  blockers: none",
-			"  edited in the last 30m: none",
-		].join("\n"),
-	);
+			"claude:root",
+			"waiting",
+			"2m ago",
+			"user",
+			"2",
+			"/work/status (stream/2e)",
+			"Ship it with the tests",
+		],
+	]);
+	expect(result.output).not.toContain("Push the branch?");
+	expect(result.output).not.toContain("Wrote the command");
+	expect(result.output).not.toContain("a.ts");
 });
 
-test("the caller's own Claude and Codex sessions are left out, and their subagents move to the top level", async () => {
+test("in a terminal the objective is cut to the width, and piped it's printed in full", async () => {
+	const objective = `Build the parser ${"and more ".repeat(30)}end`;
+	const piped = testApp();
+	const terminal = testApp({ outputColumns: 80 });
+	for (const app of [piped, terminal]) {
+		addSession(app, "claude:root", { state: "busy" });
+		addSummary(
+			app,
+			"claude:root",
+			addEvents(app, "claude:root", [message(5)]),
+			{
+				objective,
+			},
+		);
+	}
+
+	const full = await runSummaries(piped, ["list"]);
+	const cut = await runSummaries(terminal, ["list"]);
+
+	expect(rowsOf(full.output)[0]?.at(-1)).toBe(objective);
+	const row = cut.output.split("\n").at(-1) ?? "";
+	expect(Bun.stringWidth(row)).toBeLessThanOrEqual(80);
+	expect(Bun.stringWidth(row)).toBeGreaterThan(70);
+	expect(row).toEndWith("…");
+	expect(row).toContain("Build the parser and more");
+});
+
+test("in a terminal the table prints the shortest unique ids and bare ages, each id resolving through `get`; piped it keeps full ids", async () => {
+	const ids = [
+		"claude:ac768d0a-1111",
+		"claude:ac768d0a-2222",
+		"claude:12345678abcdef",
+		"codex:01a16b34-598b",
+	];
+	const piped = testApp();
+	const terminal = testApp({ outputColumns: 200 });
+	for (const app of [piped, terminal]) {
+		for (const [index, id] of ids.entries()) {
+			addSession(app, id, { state: "busy", startedMinutesAgo: 10 + index });
+			addSummary(app, id, addEvents(app, id, [message(5)]));
+		}
+	}
+
+	const full = await runSummaries(piped, ["list"]);
+	const short = await runSummaries(terminal, ["list"]);
+
+	expect(rowsOf(full.output).map((row) => [row[0], row[2]])).toEqual(
+		ids.map((id) => [id, "5m ago"]),
+	);
+	const shortRows = rowsOf(short.output).map((row) => [row[0], row[2]]);
+	expect(shortRows).toEqual([
+		["claude:ac768d0a-1", "5m"],
+		["claude:ac768d0a-2", "5m"],
+		["claude:12345678", "5m"],
+		["codex:01a16b34", "5m"],
+	]);
+	for (const [index, [shortId]] of shortRows.entries()) {
+		const resolved = await runSummaries(terminal, ["get", shortId ?? ""]);
+		expect(resolved.output).toStartWith(`${ids[index]}  busy`);
+	}
+});
+
+test("the heading names the caller's own session, which is left out, and its subagents are marked as subagents at the top level", async () => {
 	const app = testApp();
-	await writeOwnPidFile(app, "self");
 	process.env.CODEX_THREAD_ID = "thread-self";
-	addSession(app, "claude:self", { state: "busy" });
-	addSession(app, "claude:sibling", {
-		parentId: "claude:self",
+	addSession(app, "codex:thread-self", { state: "busy" });
+	addSession(app, "codex:sibling", {
+		parentId: "codex:thread-self",
 		state: "busy",
 	});
-	addSession(app, "codex:thread-self", { state: "busy" });
 	addSession(app, "codex:peer", { state: "idle" });
-	for (const id of [
-		"claude:self",
-		"claude:sibling",
-		"codex:thread-self",
-		"codex:peer",
-	]) {
+	for (const id of ["codex:thread-self", "codex:sibling", "codex:peer"]) {
 		addSummary(app, id, addEvents(app, id, [message(5)]));
 	}
 
-	const result = await runSummaries(app, ["--all"]);
+	const result = await runSummaries(app, ["list"]);
 
-	expect(headlines(result.output).sort()).toEqual([
-		"claude:sibling  busy  active 5m ago",
-		"codex:peer  idle  active 5m ago",
+	expect(idColumn(result.output).sort()).toEqual([
+		"codex:peer",
+		"↑ codex:sibling",
 	]);
-	expect(result.output).toContain("  parent: claude:self (this session)");
-	expect(result.output.split("\n")[0]).toContain(
-		"leaving out this session: codex:thread-self, claude:self",
+	expect(result.output.split("\n")[0]).toBe(
+		"2 live sessions, leaving out this session: codex:thread-self",
 	);
 });
 
-test("a pid file whose procStart isn't this process's start doesn't make its session the caller", async () => {
-	const app = testApp();
-	await writeOwnPidFile(app, "stale", {
-		procStart: "Thu Jan  1 00:00:00 1970",
-	});
-	addSession(app, "claude:stale", { state: "busy" });
-	addSummary(app, "claude:stale", addEvents(app, "claude:stale", [message(5)]));
-
-	const result = await runSummaries(app, []);
-
-	expect(headlines(result.output)).toEqual([
-		"claude:stale  busy  active 5m ago",
-	]);
-	expect(result.output).not.toContain("leaving out");
-});
-
-test("a subagent under a hidden parent shows that parent, and the hidden one's edits go to the entry above it", async () => {
-	const app = testApp();
-	addSession(app, "codex:root", { state: "busy", startedMinutesAgo: 50 });
-	addSession(app, "codex:child", {
-		parentId: "codex:root",
-		state: "ended",
-		startedMinutesAgo: 40,
-	});
-	addSession(app, "codex:grandchild", {
-		parentId: "codex:child",
-		state: "busy",
-		startedMinutesAgo: 30,
-	});
-	const rootIds = addEvents(app, "codex:root", [
-		toolCall("Edit", "/work/root.ts", "ok", 9),
-	]);
-	const childIds = addEvents(app, "codex:child", [
-		toolCall("apply_patch", "/work/child.ts", "ok", 6),
-	]);
-	const grandchildIds = addEvents(app, "codex:grandchild", [
-		toolCall("Write", "/work/grandchild.ts", "ok", 3),
-	]);
-	addSummary(app, "codex:grandchild", grandchildIds);
-	addSummary(app, "codex:child", [...childIds, ...grandchildIds]);
-	addSummary(app, "codex:root", [...rootIds, ...childIds, ...grandchildIds]);
-
-	const result = await runSummaries(app, []);
-
-	expect(result.exitCode).toBe(0);
-	expect(headlines(result.output)).toEqual([
-		"codex:root  busy  active 9m ago",
-		"    codex:grandchild  busy  active 3m ago",
-	]);
-	expect(result.output).toContain(
-		[
-			"  edited in the last 30m:",
-			"    - /work/child.ts",
-			"    - /work/root.ts",
-			"",
-			"    codex:grandchild  busy  active 3m ago",
-			"      parent: codex:child",
-		].join("\n"),
-	);
-	expect(result.output).toContain(
-		["      edited in the last 30m:", "        - /work/grandchild.ts"].join(
-			"\n",
-		),
-	);
-});
-
-test("files edited in the last 30 minutes come from edit tools that weren't refused", async () => {
-	const app = testApp();
-	addSession(app, "codex:root", { state: "busy" });
-	const ids = addEvents(app, "codex:root", [
-		toolCall("Edit", "/work/old.ts", "ok", 45),
-		toolCall("Write", "/work/new.ts", "ok", 20),
-		toolCall("apply_patch", "/work/a.ts\n/work/b.ts", "pending", 10),
-		toolCall("Edit", "/work/denied.ts", "user_denied", 9),
-		toolCall("Bash", "rm /work/c.ts", "ok", 8),
-		toolCall("Edit", "/work/new.ts", "ok", 2),
-	]);
-	addSummary(app, "codex:root", ids);
-
-	const result = await runSummaries(app, []);
-
-	expect(result.output).toContain(
-		[
-			"  edited in the last 30m:",
-			"    - /work/new.ts",
-			"    - /work/a.ts",
-			"    - /work/b.ts",
-		].join("\n"),
-	);
-	expect(result.output).not.toContain("old.ts");
-	expect(result.output).not.toContain("denied.ts");
-	expect(result.output).not.toContain("c.ts");
-});
-
-test("a summary is marked behind when a deferred family has moved past it, and a session without one says so", async () => {
+test("WAITING says behind when a deferred family has moved past the summary, and no summary when there is none", async () => {
 	const app = testApp();
 	addSession(app, "claude:root", { state: "busy", startedMinutesAgo: 50 });
-	addSession(app, "claude:helper", {
-		parentId: "claude:root",
-		state: "busy",
-		startedMinutesAgo: 40,
-	});
-	addSession(app, "claude:fresh", {
-		parentId: "claude:root",
-		state: "busy",
-		startedMinutesAgo: 30,
-	});
-	addSession(app, "codex:new", { state: "ended", startedMinutesAgo: 20 });
-	const rootIds = addEvents(app, "claude:root", [message(9)]);
-	const freshIds = addEvents(app, "claude:fresh", [message(8)]);
-	addSummary(app, "claude:root", [...rootIds, ...freshIds], {
-		updatedMinutesAgo: 5,
-	});
-	addSummary(app, "claude:fresh", freshIds, { updatedMinutesAgo: 5 });
-	addSummary(app, "claude:helper", [], { updatedMinutesAgo: 5 });
-	addEvents(app, "claude:helper", [message(1)]);
+	addSession(app, "codex:new", { state: "busy", startedMinutesAgo: 20 });
+	const ids = addEvents(app, "claude:root", [message(9)]);
+	addSummary(app, "claude:root", ids, { updatedMinutesAgo: 5 });
+	addEvents(app, "claude:root", [message(1)]);
 
-	const result = await runSummaries(app, ["--all"]);
+	const result = await runSummaries(app, ["list"]);
 
-	expect(result.exitCode).toBe(0);
-	expect(headlines(result.output)).toEqual([
-		"codex:new  ended  active 20m ago  no summary yet",
-		"claude:root  busy  active 9m ago  summary behind",
-		"    claude:fresh  busy  active 8m ago",
-		"    claude:helper  busy  active 1m ago  summary behind",
+	expect(rowsOf(result.output).map((row) => [row[0], row[3]])).toEqual([
+		["codex:new", "no summary"],
+		["claude:root", "behind"],
 	]);
 });
 
@@ -280,18 +219,65 @@ test("a failed refresh prints the list, then the failure, marks that summary beh
 	addSummary(app, "claude:root", ids, { updatedMinutesAgo: 9 });
 	addEvents(app, "claude:root", [message(1)]);
 
-	const result = await runSummaries(app, []);
+	const result = await runSummaries(app, ["list"]);
 
 	expect(result.exitCode).toBe(1);
-	expect(headlines(result.output)).toEqual([
-		"claude:root  idle  active 1m ago  summary behind",
-	]);
+	expect(rowsOf(result.output).map((row) => row[3])).toEqual(["behind"]);
 	expect(result.output).toContain(
 		"\n\nfailed: summary claude:root: askClaude was called without a fake",
 	);
 });
 
-test("--session shows one session in full, with its subagents and its recent tool calls, whatever its state", async () => {
+test("`summaries get` carries what the list leaves out: parent, ask, progress, tried, next, blockers and the edited files", async () => {
+	const app = testApp();
+	addSession(app, "claude:root", { state: "idle" });
+	addSession(app, "claude:child", {
+		parentId: "claude:root",
+		state: "waiting",
+		title: "Add the summaries command",
+		cwd: "/work/status",
+		branch: "stream/2e",
+	});
+	const ids = addEvents(app, "claude:child", [
+		toolCall("Edit", "/work/status/a.ts", "ok", 4),
+	]);
+	addSummary(app, "claude:child", ids, {
+		progress: "Wrote the command\nWrote the tests",
+		tried: "Bun.spawn with a PATH fake, which ran the real claude",
+		next: "Open the PR",
+		blockers: "",
+		waitingOn: "user",
+		ask: "Push the branch?\nThe tests pass.",
+	});
+
+	const result = await runSummaries(app, ["get", "claude:child"]);
+
+	expect(result.output).toStartWith(
+		[
+			"claude:child  waiting  active 4m ago",
+			"  title: Add the summaries command",
+			"  parent: claude:root",
+			"  cwd: /work/status",
+			"  branch: stream/2e",
+			"  objective: Ship it",
+			"  outcome: in_progress, waiting on user",
+			"  ask: Push the branch?",
+			"    The tests pass.",
+			"  progress:",
+			"    - Wrote the command",
+			"    - Wrote the tests",
+			"  tried:",
+			"    - Bun.spawn with a PATH fake, which ran the real claude",
+			"  next:",
+			"    - Open the PR",
+			"  blockers: none",
+			"  edited in the last 30m:",
+			"    - /work/status/a.ts",
+		].join("\n"),
+	);
+});
+
+test("`summaries get` shows one session in full, with its subagents and its recent tool calls, whatever its state", async () => {
 	const app = testApp();
 	addSession(app, "codex:root", { state: "ended" });
 	addSession(app, "codex:child", {
@@ -310,8 +296,8 @@ test("--session shows one session in full, with its subagents and its recent too
 	addSummary(app, "codex:root", ids);
 	addSummary(app, "codex:child", []);
 
-	const result = await runSummaries(app, ["--session", "codex:root"]);
-	const child = await runSummaries(app, ["--session", "codex:grandchild"]);
+	const result = await runSummaries(app, ["get", "codex:root"]);
+	const child = await runSummaries(app, ["get", "codex:grandchild"]);
 
 	expect(result.exitCode).toBe(0);
 	expect(result.output).toContain(
@@ -333,17 +319,35 @@ test("--session shows one session in full, with its subagents and its recent too
 	);
 });
 
-test("an unknown --session id fails closed", async () => {
+test("an unknown session id fails closed after the refresh", async () => {
 	const app = testApp();
 
-	const result = await runSummaries(app, ["--session", "claude:nope"]);
+	const result = await runSummaries(app, ["get", "claude:nope"]);
 
 	expect(result.exitCode).toBe(1);
 	expect(result.output).toBe('status: unknown session "claude:nope"');
 });
 
-function testApp(): App {
-	return createTestApp({ adapters: [], now: () => NOW });
+test("`summaries get` fails closed on a prefix several sessions share, listing them", async () => {
+	const app = testApp();
+	addSession(app, "claude:ac768d0a-2222", { state: "ended", title: "Second" });
+	addSession(app, "claude:ac768d0a-1111", { state: "ended" });
+	addSession(app, "codex:01a1", { state: "ended", title: "Spike" });
+
+	const result = await runSummaries(app, ["get", "claude:ac768d0a"]);
+
+	expect(result.exitCode).toBe(1);
+	expect(result.output).toBe(
+		[
+			'status: "claude:ac768d0a" matches 2 sessions; give more of the id:',
+			"  claude:ac768d0a-1111  untitled",
+			"  claude:ac768d0a-2222  Second",
+		].join("\n"),
+	);
+});
+
+function testApp(overrides: Partial<App> = {}): App {
+	return createTestApp({ adapters: [], now: () => NOW, ...overrides });
 }
 
 async function runSummaries(app: App, args: string[]) {
@@ -351,26 +355,17 @@ async function runSummaries(app: App, args: string[]) {
 	return { ...result, output: Bun.stripANSI(result.output) };
 }
 
-function headlines(output: string): string[] {
-	return output.split("\n").filter((line) => /^\s*(claude|codex):/.test(line));
+function rowsOf(output: string): string[][] {
+	const lines = output.split("\n");
+	const start = lines.findIndex((line) => line.startsWith("ID  "));
+	const end = lines.indexOf("", start);
+	return lines
+		.slice(start + 1, end === -1 ? undefined : end)
+		.map((line) => line.split(/(?<=\S) {2,}/));
 }
 
-async function writeOwnPidFile(
-	app: App,
-	sessionId: string,
-	extra: Record<string, unknown> = {},
-) {
-	const directory = join(app.paths.claude, "sessions");
-	mkdirSync(directory, { recursive: true });
-	await Bun.write(
-		join(directory, `${process.pid}.json`),
-		JSON.stringify({
-			pid: process.pid,
-			sessionId,
-			kind: "interactive",
-			...extra,
-		}),
-	);
+function idColumn(output: string): string[] {
+	return rowsOf(output).map((row) => row[0] ?? "");
 }
 
 function addSession(

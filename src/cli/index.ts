@@ -1,38 +1,78 @@
 import type { App } from "@src/app";
-import { STATUS_USAGE, status } from "./commands/status";
-import { SUMMARIES_USAGE, summaries } from "./commands/summaries";
-import { type CommandResult, failure, usage } from "./utils";
+import { describeError } from "@src/utils";
+import {
+	STATUS_GET,
+	STATUS_LIST,
+	statusGet,
+	statusList,
+} from "./commands/status";
+import {
+	SUMMARIES_GET,
+	SUMMARIES_LIST,
+	summariesGet,
+	summariesList,
+} from "./commands/summaries";
+import {
+	type CommandHelp,
+	type CommandResult,
+	failure,
+	help,
+	usage,
+} from "./utils";
 
 export async function run(
 	args: string[],
 	openApp: () => App,
 ): Promise<CommandResult> {
-	const [name, ...rest] = args;
-	if (name === "--help" || name === "-h") {
-		return { output: usage(STATUS_USAGE, SUMMARIES_USAGE), exitCode: 0 };
+	const [first, ...rest] = args;
+	if (first === "summaries") {
+		return runNoun(SUMMARIES_NOUN, rest, openApp);
 	}
-	if (name === "summaries") {
-		return runCommand(summaries, rest, openApp);
-	}
-	if (name === undefined || name.startsWith("-")) {
-		return runCommand(status, args, openApp);
-	}
-	return failure(
-		`unknown command "${name}"`,
-		usage(STATUS_USAGE, SUMMARIES_USAGE),
-	);
+	return runNoun(STATUS_NOUN, args, openApp);
 }
 
-async function runCommand(
-	command: Command,
+async function runNoun(
+	noun: Noun,
 	args: string[],
 	openApp: () => App,
 ): Promise<CommandResult> {
+	const [verb, ...rest] = args;
+	if (verb === undefined || verb === "--help" || verb === "-h") {
+		return { output: help(...noun.help), exitCode: 0 };
+	}
+	const command = noun.verbs.find((candidate) => candidate.verb === verb);
+	if (!command) {
+		const synopses = usage(...noun.help.map((entry) => entry.synopsis));
+		return failure(`unknown command "${noun.prefix}${verb}"`, synopses);
+	}
 	try {
-		return await command(args, openApp);
+		return await command.run(rest, openApp);
 	} catch (error) {
-		return failure(error instanceof Error ? error.message : String(error));
+		return failure(describeError(error));
 	}
 }
 
-type Command = (args: string[], openApp: () => App) => Promise<CommandResult>;
+type Verb = {
+	verb: string;
+	run(args: string[], openApp: () => App): Promise<CommandResult>;
+};
+
+type Noun = { prefix: string; verbs: Verb[]; help: CommandHelp[] };
+
+const STATUS_NOUN: Noun = {
+	prefix: "",
+	verbs: [
+		{ verb: "list", run: statusList },
+		{ verb: "get", run: statusGet },
+	],
+	help: [STATUS_LIST, STATUS_GET, SUMMARIES_LIST, SUMMARIES_GET],
+};
+
+const SUMMARIES_NOUN: Noun = {
+	prefix: "summaries ",
+	verbs: [
+		{ verb: "list", run: summariesList },
+		{ verb: "get", run: summariesGet },
+	],
+	help: [SUMMARIES_LIST, SUMMARIES_GET],
+};

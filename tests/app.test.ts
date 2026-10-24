@@ -1,5 +1,5 @@
 import { expect, onTestFinished, test } from "bun:test";
-import { createApp, defaultStatusHome } from "@src/app";
+import { createApp, defaultStatusHome, progressTo } from "@src/app";
 import { createTemporaryHome } from "@tests/utils";
 import { mkdirSync, mkdtempSync, rmSync } from "fs";
 import { homedir, tmpdir } from "os";
@@ -46,6 +46,43 @@ test("createApp takes every home from the environment and opens status.db there"
 		"codex",
 	]);
 });
+
+test("progress writes a line stamped with local ISO 8601 time and its offset, then the tag, to a terminal", () => {
+	const savedZone = process.env.TZ;
+	onTestFinished(() => {
+		process.env.TZ = savedZone;
+	});
+	const terminal = fakeStream(true);
+	const at = new Date("2026-10-24T17:42:07.900Z");
+
+	process.env.TZ = "America/Los_Angeles";
+	progressTo(terminal, () => at)("sync", "claude: reading 3 sources");
+	process.env.TZ = "Asia/Kolkata";
+	progressTo(terminal, () => at)("judge", "answered");
+	process.env.TZ = "UTC";
+	progressTo(terminal, () => at)("total", "done");
+
+	expect(terminal.written.map((line) => Bun.stripANSI(line))).toEqual([
+		"2026-10-24T10:42:07-07:00 [sync] claude: reading 3 sources\n",
+		"2026-10-24T23:12:07+05:30 [judge] answered\n",
+		"2026-10-24T17:42:07+00:00 [total] done\n",
+	]);
+});
+
+test("progress writes nothing when stderr isn't a terminal, so an agent or a pipe gets only the output", () => {
+	const pipe = fakeStream(false);
+	const progress = progressTo(pipe, () => new Date());
+
+	progress("summaries", "started 1/1 claude:abc");
+	progress("judge", "asking Opus to group 1 session by goal");
+
+	expect(pipe.written).toEqual([]);
+});
+
+function fakeStream(isTTY: boolean) {
+	const written: string[] = [];
+	return { isTTY, written, write: (text: string) => written.push(text) };
+}
 
 function createCheckout() {
 	const checkout = mkdtempSync(join(tmpdir(), "status-checkout-"));

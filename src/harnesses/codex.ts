@@ -22,6 +22,11 @@ export function createCodexAdapter(home: string): HarnessAdapter {
 	};
 }
 
+export function codexSessionIn(environment: typeof process.env): string | null {
+	const threadId = environment.CODEX_THREAD_ID;
+	return threadId ? `codex:${threadId}` : null;
+}
+
 async function listRollouts(home: string, since: Date): Promise<string[]> {
 	const root = join(home, "sessions");
 	if (!(await isDirectory(root))) {
