@@ -50,7 +50,6 @@ export async function refresh(app: App, days: number): Promise<Refresh> {
 	};
 }
 
-/** @public */
 export function colorize(text: string, tone: Tone): string {
 	const code = Bun.color(TONES[tone], "ansi");
 	return code ? `${code}${text}${RESET}` : text;

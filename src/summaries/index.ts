@@ -455,7 +455,7 @@ function sessionRows(database: Reader): SessionRow[] {
 		.all();
 }
 
-function newestEventIdBySession(database: Reader): Map<string, number> {
+export function newestEventIdBySession(database: Reader): Map<string, number> {
 	const rows = database
 		.select({ sessionId: events.sessionId, newest: max(events.id) })
 		.from(events)
@@ -464,7 +464,9 @@ function newestEventIdBySession(database: Reader): Map<string, number> {
 	return new Map(rows.map((row) => [row.sessionId, row.newest ?? 0]));
 }
 
-function summariesBySession(database: Reader): Map<string, StoredSummary> {
+export function summariesBySession(
+	database: Reader,
+): Map<string, StoredSummary> {
 	const rows = database.select().from(summaries).all();
 	return new Map(rows.map((row) => [row.sessionId, row]));
 }
