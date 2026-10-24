@@ -2,6 +2,8 @@
 
 `refreshSummaries(app)` keeps one rolling Haiku summary per session in `summaries`, subagents included, so an agent or the user can act on a session without opening its transcript. A subagent's summary feeds its parent's. It reads `sessions` and `events`, which sync writes, and owns every read and write of `summaries`, with one exception: when an interactive Claude session moves into a background job, sync deletes the old session, its events and its summary, and reparents its subagents to the continuation, so a summary can vanish without summaries doing it.
 
+**The commands read stored summaries and newest event ids through these two selectors,** `summariesBySession` and `newestEventIdBySession`, exported from `index.ts`.
+
 ## The report
 
 `refreshSummaries` returns a `SummaryReport` and never throws for one session's failure:
